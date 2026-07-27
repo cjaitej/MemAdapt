@@ -173,7 +173,48 @@ analytic model is the more accurate of the two here; the gap is expected and sta
 
 ---
 
-## 7. Still open
+## 7. Three ways to accidentally recompile every step
+
+`torch.compile` takes **~4 minutes** per compile on this GPU, so anything that
+invalidates a guard every step makes training effectively impossible — the first
+attempt at a 150-step run never reached step 25 in 45 minutes. All three causes were
+Python-level values read inside `forward`:
+
+| cause | symptom | fix |
+|---|---|---|
+| `_stats()` calling `.item()` | graph break + GPU→CPU sync every forward | return **tensors**; convert once outside via `stats_to_floats` |
+| `gate_floor` as an annealed float | recompile every warmup step | `register_buffer`, written with `.fill_()` |
+| `entropy_weight` as a float argument | recompile every step | buffer + `set_entropy_weight()` |
+
+The general rule: **any scalar that changes during training must be a buffer written
+in place, never a Python float or a forward argument.** Tensor identity is stable, so
+no guard is invalidated.
+
+Capacity is the deliberate exception — it changes `k`, hence tensor shapes, so a
+recompile is unavoidable. That is why `capacity_at` is quantised into levels: each
+level costs one recompile (~4 min). Four levels is ~3% overhead on a 10-hour run and
+intolerable on a short one, so short debug runs should pass
+`--capacity-warmup-frac 0 --capacity-anneal-frac 0`.
+
+## 8. Router thresholds must be calibrated before `agree/*` means anything
+
+`TopKTokenRouter.threshold` starts at 0 and is only set by `calibrate_routers`.
+Uncalibrated, the causal predictor classifies every token as routed and
+`agreement` returns the *routing rate* — a number that looks like an accuracy,
+tracks nothing, and stays plausibly around 0.5.
+
+`evaluate()` now calibrates before measuring. **The bank must be passed to
+`calibrate_routers`**: without it the memory read is skipped, so `mem_router` never
+runs, never calibrates, and its agreement reports exactly `mem_capacity` (0.25 — the
+tell that caught this).
+
+**Currently near chance (0.43–0.51 at 60 steps)** and this is the single most important
+number to watch as training scales up. The aux head predicts top-k membership from the
+same features the router scores, so it *should* reach high agreement. If it has not
+cleared ~0.85 by mid-training, causal generation is running a different model than the
+one trained, and every generation-time result needs an asterisk.
+
+## 9. Still open
 
 - **`mem_size` is 2048 during training** to bound the B×H×T×M similarity tensor. Larger
   banks are an eval-time knob; train/eval mismatch at large M is untested.

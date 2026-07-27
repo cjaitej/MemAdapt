@@ -22,6 +22,7 @@ import torch
 
 from amt.data import DocSegmentLoader, make_random_shard
 from amt.model import AMT, FlopModel, TopKTokenRouter, variant
+from amt.model.amt import stats_to_floats
 from amt.model.blocks import MemoryBlock
 
 
@@ -86,7 +87,7 @@ def set_capacity(model, depth_capacity, mem_capacity):
 def set_gate_floor(model, floor):
     for m in model.modules():
         if isinstance(m, MemoryBlock):
-            m.gate_floor = floor
+            m.gate_floor.fill_(floor)      # in place: see MemoryBlock.gate_floor
 
 
 # ---------------------------------------------------------------------------
@@ -94,11 +95,28 @@ def set_gate_floor(model, floor):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate(model, loader, bank, device, device_type, steps=20):
+def evaluate(model, loader, bank, device, device_type, steps=20, raw_model=None):
+    """Validation loss plus routing telemetry.
+
+    Calibrates the router thresholds first. Without it `agree/*` compares the causal
+    predictor against an uncalibrated threshold and reports a number near the routing
+    rate regardless of how good the predictor is -- i.e. it looks like a real metric
+    and measures nothing.
+    """
     model.eval()
     loader.reset()
     if bank is not None:
         bank.clear()
+
+    if raw_model is not None:
+        calib = [loader.next_batch()[0] for _ in range(3)]
+        # The bank must be passed: without it the memory layer's read is skipped
+        # entirely, so mem_router never runs, never gets calibrated, and its
+        # agreement silently reports the routing rate instead of an accuracy.
+        raw_model.calibrate_routers(calib, device=device, bank=bank)
+        loader.reset()
+        if bank is not None:
+            bank.clear()
     total, agg = 0.0, {}
     for _ in range(steps):
         x, y, reset = loader.next_batch()
@@ -109,7 +127,7 @@ def evaluate(model, loader, bank, device, device_type, steps=20):
             _, losses, stats, kv = model(x, targets=y, bank=bank)
         model.write_memory(bank, kv)
         total += losses["lm"].item()
-        for k, v in stats.items():
+        for k, v in stats_to_floats(stats).items():
             agg[k] = agg.get(k, 0.0) + v
     model.train()
     n = steps
@@ -145,6 +163,13 @@ def main():
     ap.add_argument("--ckpt-every", type=int, default=2000)
     ap.add_argument("--log-every", type=int, default=1)
     ap.add_argument("--compile", action="store_true")
+    ap.add_argument("--capacity-warmup-frac", type=float, default=0.1,
+                    help="fraction of steps run dense before routing tightens")
+    ap.add_argument("--capacity-anneal-frac", type=float, default=0.4,
+                    help="fraction of steps by which target capacity is reached")
+    ap.add_argument("--capacity-levels", type=int, default=4,
+                    help="anneal granularity; EACH level costs one torch.compile "
+                         "recompile, so use 0 warmup/anneal for short debug runs")
     ap.add_argument("--seed", type=int, default=1337)
     args = ap.parse_args()
 
@@ -190,6 +215,7 @@ def main():
     print(fm.summary())
     print()
 
+    raw_model = model                  # buffer writes must target the real module
     if args.compile:
         model = torch.compile(model)
 
@@ -208,15 +234,22 @@ def main():
         t0 = time.time()
         last = step == args.max_steps - 1
 
-        dc = capacity_at(step, cfg.depth_capacity, args.max_steps)
-        mc = capacity_at(step, cfg.mem_capacity, args.max_steps)
-        set_capacity(model, dc, mc)
-        set_gate_floor(model, gate_floor_at(step, args.max_steps))
+        dc = capacity_at(step, cfg.depth_capacity, args.max_steps,
+                         args.capacity_warmup_frac, args.capacity_anneal_frac,
+                         args.capacity_levels)
+        mc = capacity_at(step, cfg.mem_capacity, args.max_steps,
+                         args.capacity_warmup_frac, args.capacity_anneal_frac,
+                         args.capacity_levels)
+        set_capacity(raw_model, dc, mc)
+        set_gate_floor(raw_model, gate_floor_at(step, args.max_steps,
+                                                args.capacity_warmup_frac))
         ent_w = cfg.lambda_entropy * max(0.0, 1.0 - step / (0.4 * args.max_steps))
+        raw_model.set_entropy_weight(ent_w)
 
         if step % args.eval_every == 0 or last:
             val_loss, val_stats = evaluate(model, val_loader, bank, device,
-                                           device_type, args.eval_steps)
+                                           device_type, args.eval_steps,
+                                           raw_model=raw_model)
             print(f"  [eval] step {step} val_loss {val_loss:.4f} "
                   f"ppl {math.exp(min(val_loss, 20)):.2f} "
                   f"layers/tok {val_stats.get('layers_per_token', 0):.2f}")
@@ -236,13 +269,12 @@ def main():
             if bank is not None:
                 bank.clear(reset)
             with autocast:
-                _, losses, stats, kv = model(x, targets=y, bank=bank,
-                                             entropy_weight=ent_w)
+                _, losses, stats, kv = model(x, targets=y, bank=bank)
             model.write_memory(bank, kv)
             (losses["total"] / grad_accum).backward()
             for k in acc:
                 acc[k] += losses[k].item() / grad_accum
-            last_stats = stats
+            last_stats = stats  # tensors; converted once below, not per micro-step
 
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         lr = lr_at(step, args.max_lr, args.max_lr * args.min_lr_frac,
@@ -257,6 +289,7 @@ def main():
         tps = args.total_batch_tokens / dt
 
         if step % args.log_every == 0:
+            last_stats = stats_to_floats(last_stats)
             row = {"step": step, "split": "train", "loss": acc["lm"],
                    "aux": acc["aux"], "entropy": acc["entropy"], "lr": lr,
                    "grad_norm": float(norm), "depth_capacity": dc, "mem_capacity": mc,

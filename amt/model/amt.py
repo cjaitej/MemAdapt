@@ -22,6 +22,15 @@ from .memory import KVMemoryBank
 from .routers import TopKTokenRouter
 
 
+def stats_to_floats(stats):
+    """Convert the tensor telemetry from AMT.forward into plain floats.
+
+    Call this OUTSIDE the compiled region -- once per logged step, not per forward.
+    See AMT._stats for why the conversion cannot live inside the model.
+    """
+    return {k: (v.item() if torch.is_tensor(v) else v) for k, v in stats.items()}
+
+
 class AMT(nn.Module):
 
     def __init__(self, config: AMTConfig):
@@ -45,6 +54,14 @@ class AMT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight   # weight tying
+
+        # Annealed by the trainer. A buffer rather than a forward argument for the
+        # same reason as MemoryBlock.gate_floor: a Python float that changes every
+        # step forces torch.compile to recompile every step. Set with
+        # `set_entropy_weight`, which writes in place.
+        self.register_buffer("entropy_weight",
+                             torch.tensor(float(config.lambda_entropy)),
+                             persistent=False)
 
         self.apply(self._init_weights)
         # Routers and gates carry deliberate non-default inits (target routing rate,
@@ -74,8 +91,12 @@ class AMT(nn.Module):
 
     # -- forward -----------------------------------------------------------
 
+    def set_entropy_weight(self, w):
+        """Anneal the entropy bonus. In-place so no compile guard is invalidated."""
+        self.entropy_weight.fill_(float(w))
+
     def forward(self, idx, targets=None, bank=None, causal=False,
-                return_logits=False, entropy_weight=None):
+                return_logits=False):
         """
         Parameters
         ----------
@@ -84,7 +105,6 @@ class AMT(nn.Module):
             `write_memory`. Never written to inside forward (invariant R6).
         causal : route with the auxiliary causal predictor instead of top-k. Required
             for autoregressive generation; optional at eval to measure the gap.
-        entropy_weight : override for config.lambda_entropy (annealed during training).
 
         Returns (logits_or_None, losses, stats, kv_to_write)
         """
@@ -117,11 +137,12 @@ class AMT(nn.Module):
         if return_logits or targets is None:
             logits = self.lm_head(x)
 
-        ew = c.lambda_entropy if entropy_weight is None else entropy_weight
-        losses.update(self._router_losses(route_outs, entropy_weight=ew))
+        losses.update(self._router_losses(route_outs))
         if targets is not None:
             losses["total"] = (
-                losses["lm"] + c.lambda_aux * losses["aux"] - ew * losses["entropy"]
+                losses["lm"]
+                + c.lambda_aux * losses["aux"]
+                - self.entropy_weight * losses["entropy"]
             )
 
         return logits, losses, self._stats(route_outs, conf, T), kv
@@ -153,7 +174,7 @@ class AMT(nn.Module):
                 total = total + chunk_loss(xc, tc).float()
         return total / flat_t.numel()
 
-    def _router_losses(self, route_outs, entropy_weight):
+    def _router_losses(self, route_outs):
         if not route_outs:
             zero = torch.zeros((), device=self.lm_head.weight.device)
             return {"aux": zero, "entropy": zero}
@@ -163,20 +184,29 @@ class AMT(nn.Module):
 
     @torch.no_grad()
     def _stats(self, route_outs, conf, T):
+        """Routing telemetry, returned as TENSORS.
+
+        Nothing here may call `.item()`. Doing so inside the forward pass is a
+        torch.compile graph break plus a GPU->CPU sync on every step -- measured as
+        several minutes of extra compile time and a visible throughput loss, worst on
+        the variants with the most routers, i.e. exactly the ones being evaluated.
+        Callers convert with `stats_to_floats` once, outside the compiled region.
+        """
         c = self.config
         n_always_on = c.n_layer - len(c.adaptive_layers)
+        layers = conf.new_tensor(float(n_always_on))
         stats = {
-            "layers_per_token": float(n_always_on),
-            "mem_conf_mean": conf.mean().item(),
-            "mem_rate": (conf != 0).float().mean().item(),
+            "mem_conf_mean": conf.mean(),
+            "mem_rate": (conf != 0).float().mean(),
         }
         for name, router, out in route_outs:
-            rate = out["label"].mean().item()
+            rate = out["label"].mean()
             stats[f"rate/{name}"] = rate
-            stats[f"agree/{name}"] = router.agreement(out).item()
-            stats[f"score/{name}"] = out["scores"].mean().item()
+            stats[f"agree/{name}"] = router.agreement(out)
+            stats[f"score/{name}"] = out["scores"].mean()
             if name.startswith("depth"):
-                stats["layers_per_token"] += rate
+                layers = layers + rate
+        stats["layers_per_token"] = layers
         return stats
 
     def write_memory(self, bank, kv):

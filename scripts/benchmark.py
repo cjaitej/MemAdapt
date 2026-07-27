@@ -22,6 +22,7 @@ import torch
 sys.path.insert(0, ".")
 
 from amt.model import AMT, FlopModel, variant  # noqa: E402
+from amt.model.amt import stats_to_floats  # noqa: E402
 
 
 def measure(name, B, T, steps, warmup, device, compile_model=False):
@@ -71,7 +72,7 @@ def measure(name, B, T, steps, warmup, device, compile_model=False):
         "tokens_per_sec": steps * B * T / dt,
         "ms_per_step": dt / steps * 1000,
         "peak_vram_gb": peak,
-        "layers_per_token": stats["layers_per_token"],
+        "layers_per_token": stats_to_floats(stats)["layers_per_token"],
         "analytic_layer_mflops": fm.breakdown().layers / 1e6,
         "analytic_total_mflops": fm.breakdown().total / 1e6,
         "params_m": (model._orig_mod if compile_model else model).num_params() / 1e6,

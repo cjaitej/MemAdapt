@@ -142,7 +142,13 @@ class MemoryBlock(nn.Module):
         # trainer (risk R2). The gate starts near-shut so the model does not lean on
         # an untrained memory -- but a shut gate receives almost no gradient, so
         # without a floor it can stay shut permanently and memory is never learned.
-        self.gate_floor = 0.0
+        #
+        # A buffer, not a float: torch.compile specialises on Python scalars read
+        # inside forward, so an annealed float here triggers a full recompile EVERY
+        # step it changes. At ~4 minutes per compile on a laptop GPU that made short
+        # runs impossible. Written in place with .fill_() so the tensor identity is
+        # stable and no guard is invalidated.
+        self.register_buffer("gate_floor", torch.zeros(()), persistent=False)
 
     def forward(self, x, bank=None, causal=False):
         B, T, C = x.shape
@@ -177,10 +183,12 @@ class MemoryBlock(nn.Module):
             gate = torch.sigmoid(
                 self.w_gate(torch.cat([h_sel, conf.unsqueeze(-1).to(h.dtype)], dim=-1))
             )                                                             # (B, kq, nh)
-            if self.gate_floor > 0.0:
-                # Lift rather than clamp: keeps the gate differentiable everywhere,
-                # where clamp would zero the gradient for every gate under the floor.
-                gate = self.gate_floor + (1.0 - self.gate_floor) * gate
+            # Lift rather than clamp: keeps the gate differentiable everywhere, where
+            # clamp would zero the gradient for every gate under the floor. Applied
+            # unconditionally -- a `if floor > 0` branch on a tensor value is a graph
+            # break, and at floor=0 the expression is exactly the identity anyway.
+            floor = self.gate_floor.to(gate.dtype)
+            gate = floor + (1.0 - floor) * gate
             if route_out is not None and idx is None:
                 gate = gate * route_out["mask"].unsqueeze(-1).to(gate.dtype)
             gate = gate.transpose(1, 2).unsqueeze(-1)                     # (B, nh, kq, 1)
