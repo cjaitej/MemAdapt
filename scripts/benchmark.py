@@ -23,6 +23,7 @@ sys.path.insert(0, ".")
 
 from amt.model import AMT, FlopModel, variant  # noqa: E402
 from amt.model.amt import stats_to_floats  # noqa: E402
+from amt.precision import describe_device, select_precision  # noqa: E402
 
 
 def measure(name, B, T, steps, warmup, device, compile_model=False):
@@ -32,13 +33,15 @@ def measure(name, B, T, steps, warmup, device, compile_model=False):
     if compile_model:
         model = torch.compile(model)
 
-    bank = model.make_bank(B, device) if cfg.use_memory else None
+    amp_dtype, _, _ = select_precision(device, verbose=False)
+    bank = model.make_bank(B, device, dtype=amp_dtype) if cfg.use_memory else None
     opt = model.configure_optimizers(0.1, 6e-4, "cuda" if device == "cuda" else "cpu",
                                      verbose=False)
 
     x = torch.randint(0, cfg.vocab_size, (B, T), device=device)
     y = torch.randint(0, cfg.vocab_size, (B, T), device=device)
-    autocast = torch.autocast(device_type=device, dtype=torch.bfloat16) if device == "cuda" else torch.autocast("cpu", enabled=False)
+    autocast = torch.autocast(device_type=device, dtype=amp_dtype,
+                              enabled=device == "cuda")
 
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
@@ -125,7 +128,7 @@ def main():
     a = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"device: {torch.cuda.get_device_name(0) if device == 'cuda' else 'cpu'}")
+    print(f"device: {describe_device()}")
     print(f"shape : B={a.batch_size} T={a.block_size}\n")
 
     rows = []

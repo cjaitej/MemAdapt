@@ -24,6 +24,7 @@ from amt.data import DocSegmentLoader, make_random_shard
 from amt.model import AMT, FlopModel, TopKTokenRouter, variant
 from amt.model.amt import stats_to_floats
 from amt.model.blocks import MemoryBlock
+from amt.precision import describe_device, make_scaler, select_precision
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +96,8 @@ def set_gate_floor(model, floor):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate(model, loader, bank, device, device_type, steps=20, raw_model=None):
+def evaluate(model, loader, bank, device, device_type, steps=20, raw_model=None,
+             amp_dtype=torch.bfloat16):
     """Validation loss plus routing telemetry.
 
     Calibrates the router thresholds first. Without it `agree/*` compares the causal
@@ -123,7 +125,8 @@ def evaluate(model, loader, bank, device, device_type, steps=20, raw_model=None)
         x, y = x.to(device), y.to(device)
         if bank is not None:
             bank.clear(reset)                      # BEFORE forward -- see write_memory
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+        with torch.autocast(device_type=device_type, dtype=amp_dtype,
+                            enabled=device_type == "cuda"):
             _, losses, stats, kv = model(x, targets=y, bank=bank)
         model.write_memory(bank, kv)
         total += losses["lm"].item()
@@ -163,6 +166,12 @@ def main():
     ap.add_argument("--ckpt-every", type=int, default=2000)
     ap.add_argument("--log-every", type=int, default=1)
     ap.add_argument("--compile", action="store_true")
+    ap.add_argument("--precision", choices=["auto", "bf16", "fp16", "fp32"],
+                    default="auto",
+                    help="auto picks bf16 on Ampere+ and fp16+GradScaler on T4/P100")
+    ap.add_argument("--resume", default=None,
+                    help="path to a checkpoint, or 'latest' to pick the newest in the "
+                         "run dir; needed on Kaggle/Colab where sessions are capped")
     ap.add_argument("--capacity-warmup-frac", type=float, default=0.1,
                     help="fraction of steps run dense before routing tightens")
     ap.add_argument("--capacity-anneal-frac", type=float, default=0.4,
@@ -176,6 +185,7 @@ def main():
     torch.manual_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     device_type = "cuda" if device.startswith("cuda") else "cpu"
+    print(f"device      : {describe_device()}")
     if device_type == "cuda":
         torch.cuda.manual_seed(args.seed)
         torch.set_float32_matmul_precision("high")
@@ -219,10 +229,34 @@ def main():
     if args.compile:
         model = torch.compile(model)
 
-    bank = model.make_bank(B, device) if cfg.use_memory else None
+    amp_dtype, use_scaler, _ = select_precision(
+        device_type, None if args.precision == "auto" else args.precision)
+    scaler = make_scaler(use_scaler)
+
+    # The bank stores raw keys/values, so it must match the autocast dtype or every
+    # read pays a cast and fp16 runs silently store fp16 into a bf16 buffer.
+    bank_dtype = amp_dtype if amp_dtype != torch.float32 else torch.float32
+    bank = model.make_bank(B, device, dtype=bank_dtype) if cfg.use_memory else None
     optimizer = model.configure_optimizers(args.weight_decay, args.max_lr, device_type)
-    autocast = (torch.autocast(device_type=device_type, dtype=torch.bfloat16)
+    autocast = (torch.autocast(device_type=device_type, dtype=amp_dtype)
                 if device_type == "cuda" else nullcontext())
+
+    start_step = 0
+    if args.resume:
+        ckpt_path = args.resume
+        if ckpt_path == "latest":
+            found = sorted(f for f in os.listdir(run_dir) if f.startswith("ckpt_"))
+            if not found:
+                raise FileNotFoundError(f"--resume latest: no ckpt_*.pt in {run_dir}")
+            ckpt_path = os.path.join(run_dir, found[-1])
+        ck = torch.load(ckpt_path, map_location=device, weights_only=False)
+        raw_model.load_state_dict(ck["model"])
+        optimizer.load_state_dict(ck["optimizer"])
+        train_loader.load_state_dict(ck["loader"])
+        if ck.get("scaler") is not None:
+            scaler.load_state_dict(ck["scaler"])
+        start_step = ck["step"] + 1
+        print(f"resumed from {ckpt_path} at step {start_step}")
 
     log_path = os.path.join(run_dir, "log.jsonl")
     with open(os.path.join(run_dir, "config.json"), "w") as f:
@@ -230,7 +264,7 @@ def main():
                    "flops": fm.breakdown().as_dict()}, f, indent=2)
 
     # -- loop -------------------------------------------------------------
-    for step in range(args.max_steps):
+    for step in range(start_step, args.max_steps):
         t0 = time.time()
         last = step == args.max_steps - 1
 
@@ -249,7 +283,7 @@ def main():
         if step % args.eval_every == 0 or last:
             val_loss, val_stats = evaluate(model, val_loader, bank, device,
                                            device_type, args.eval_steps,
-                                           raw_model=raw_model)
+                                           raw_model=raw_model, amp_dtype=amp_dtype)
             print(f"  [eval] step {step} val_loss {val_loss:.4f} "
                   f"ppl {math.exp(min(val_loss, 20)):.2f} "
                   f"layers/tok {val_stats.get('layers_per_token', 0):.2f}")
@@ -271,17 +305,21 @@ def main():
             with autocast:
                 _, losses, stats, kv = model(x, targets=y, bank=bank)
             model.write_memory(bank, kv)
-            (losses["total"] / grad_accum).backward()
+            scaler.scale(losses["total"] / grad_accum).backward()
             for k in acc:
                 acc[k] += losses[k].item() / grad_accum
             last_stats = stats  # tensors; converted once below, not per micro-step
 
+        # Gradients must be unscaled before clipping, or the clip threshold is
+        # applied to scaled values and effectively does nothing.
+        scaler.unscale_(optimizer)
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         lr = lr_at(step, args.max_lr, args.max_lr * args.min_lr_frac,
                    args.warmup_steps, args.max_steps)
         for g in optimizer.param_groups:
             g["lr"] = lr * (0.1 if g.get("is_router") else 1.0)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
 
         if device_type == "cuda":
             torch.cuda.synchronize()
@@ -307,6 +345,7 @@ def main():
                 "model": model.state_dict(), "config": cfg,
                 "optimizer": optimizer.state_dict(),
                 "loader": train_loader.state_dict(), "step": step, "args": vars(args),
+                "scaler": scaler.state_dict() if use_scaler else None,
             }, os.path.join(run_dir, f"ckpt_{step:06d}.pt"))
             print(f"  [ckpt] step {step}")
 
