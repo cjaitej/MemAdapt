@@ -1,0 +1,19 @@
+# PyTorch must come from the CUDA index, not PyPI:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+torch>=2.6
+
+# REQUIRED on Windows for torch.compile. Without it routing is SLOWER than dense and
+# every efficiency claim in the project inverts -- see docs/DESIGN_NOTES.md section 1.
+triton-windows; sys_platform == "win32"
+
+numpy>=1.26
+tiktoken>=0.7
+tqdm>=4.66
+pytest>=8.0
+
+# Only needed by amt/data/prepare.py --dataset fineweb
+datasets>=2.20
+
+# Optional: transformers is used by GPT.from_pretrained for the retrofit demo
+transformers>=4.40
+matplotlib>=3.8

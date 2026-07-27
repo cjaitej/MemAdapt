@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Run artefacts and corpora. Anchored to the repo root so they do not shadow the
+# amt/data/ source package.
+/data/
+/runs/
+/log/
+*.pt
+*.npy
+
+.claude/

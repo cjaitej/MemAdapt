@@ -1,0 +1,284 @@
+"""Training loop for the Adaptive Memory Transformer.
+
+Derived from `train_gpt2.py`'s loop, with three additions: auxiliary router losses, a
+capacity warmup schedule, and routing instrumentation.
+
+    python -m amt.train --variant b6_amt_joint --data-dir data/fineweb_edu_docs
+    python -m amt.train --variant b1_dense --max-steps 100 --synthetic
+
+Instrumentation is not optional. When a routing run goes wrong the loss curve looks
+almost normal -- what actually tells you is the routing rate, the gate value and the
+aux-predictor agreement. Every one of those is logged every step from step 0.
+"""
+
+import argparse
+import json
+import math
+import os
+import time
+from contextlib import nullcontext
+
+import torch
+
+from amt.data import DocSegmentLoader, make_random_shard
+from amt.model import AMT, FlopModel, TopKTokenRouter, variant
+from amt.model.blocks import MemoryBlock
+
+
+# ---------------------------------------------------------------------------
+# Schedules
+# ---------------------------------------------------------------------------
+
+def lr_at(step, max_lr, min_lr, warmup_steps, max_steps):
+    if step < warmup_steps:
+        return max_lr * (step + 1) / warmup_steps
+    if step > max_steps:
+        return min_lr
+    ratio = (step - warmup_steps) / max(max_steps - warmup_steps, 1)
+    return min_lr + 0.5 * (1.0 + math.cos(math.pi * ratio)) * (max_lr - min_lr)
+
+
+def capacity_at(step, target, max_steps, warmup_frac=0.1, anneal_frac=0.4, levels=4):
+    """Anneal capacity from dense down to the target, in a few discrete steps.
+
+    Routing on barely-contextualised embeddings is uninformed, so the stack runs dense
+    for the first `warmup_frac` of training and then tightens.
+
+    Quantised rather than continuous because k = ceil(capacity * T) determines tensor
+    shapes: a smoothly-varying capacity would change k almost every step and make
+    torch.compile recompile the whole graph each time, which costs far more than the
+    smoother schedule is worth.
+    """
+    warm, anneal = warmup_frac * max_steps, anneal_frac * max_steps
+    if step < warm:
+        return 1.0
+    if step >= anneal:
+        return target
+    frac = (step - warm) / max(anneal - warm, 1)
+    level = math.floor(frac * levels) / levels
+    return 1.0 + (target - 1.0) * level
+
+
+def gate_floor_at(step, max_steps, warmup_frac=0.1, init=0.5):
+    """Hold the memory gate open early, then release it (risk R2).
+
+    The gate is initialised near-shut so the model does not lean on noise from an
+    untrained memory. But a shut gate gets no gradient, so it can stay shut forever.
+    Forcing a floor during warmup guarantees the retrieval path is exercised while
+    it is still worth learning from.
+    """
+    warm = warmup_frac * max_steps
+    if step >= warm:
+        return 0.0
+    return init * (1.0 - step / max(warm, 1))
+
+
+# ---------------------------------------------------------------------------
+# Model surgery for the schedules
+# ---------------------------------------------------------------------------
+
+def set_capacity(model, depth_capacity, mem_capacity):
+    for m in model.modules():
+        if isinstance(m, TopKTokenRouter):
+            m.capacity = mem_capacity if m.name == "mem_router" else depth_capacity
+
+
+def set_gate_floor(model, floor):
+    for m in model.modules():
+        if isinstance(m, MemoryBlock):
+            m.gate_floor = floor
+
+
+# ---------------------------------------------------------------------------
+# Eval
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def evaluate(model, loader, bank, device, device_type, steps=20):
+    model.eval()
+    loader.reset()
+    if bank is not None:
+        bank.clear()
+    total, agg = 0.0, {}
+    for _ in range(steps):
+        x, y, reset = loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        if bank is not None:
+            bank.clear(reset)                      # BEFORE forward -- see write_memory
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            _, losses, stats, kv = model(x, targets=y, bank=bank)
+        model.write_memory(bank, kv)
+        total += losses["lm"].item()
+        for k, v in stats.items():
+            agg[k] = agg.get(k, 0.0) + v
+    model.train()
+    n = steps
+    return total / n, {k: v / n for k, v in agg.items()}
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--variant", default="b6_amt_joint")
+    ap.add_argument("--data-dir", default="data/fineweb_edu_docs")
+    ap.add_argument("--synthetic", action="store_true",
+                    help="train on generated random shards; for plumbing checks only")
+    ap.add_argument("--out-dir", default="runs")
+    ap.add_argument("--run-name", default=None)
+
+    ap.add_argument("--batch-size", type=int, default=4)
+    ap.add_argument("--block-size", type=int, default=512)
+    ap.add_argument("--total-batch-tokens", type=int, default=65536)
+    ap.add_argument("--max-steps", type=int, default=19073)
+    ap.add_argument("--warmup-steps", type=int, default=300)
+    ap.add_argument("--max-lr", type=float, default=6e-4)
+    ap.add_argument("--min-lr-frac", type=float, default=0.1)
+    ap.add_argument("--weight-decay", type=float, default=0.1)
+    ap.add_argument("--grad-clip", type=float, default=1.0)
+
+    ap.add_argument("--eval-every", type=int, default=250)
+    ap.add_argument("--eval-steps", type=int, default=20)
+    ap.add_argument("--ckpt-every", type=int, default=2000)
+    ap.add_argument("--log-every", type=int, default=1)
+    ap.add_argument("--compile", action="store_true")
+    ap.add_argument("--seed", type=int, default=1337)
+    args = ap.parse_args()
+
+    torch.manual_seed(args.seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device_type = "cuda" if device.startswith("cuda") else "cpu"
+    if device_type == "cuda":
+        torch.cuda.manual_seed(args.seed)
+        torch.set_float32_matmul_precision("high")
+
+    run_name = args.run_name or f"{args.variant}_{int(time.time())}"
+    run_dir = os.path.join(args.out_dir, run_name)
+    os.makedirs(run_dir, exist_ok=True)
+
+    # -- data -------------------------------------------------------------
+    data_dir = args.data_dir
+    if args.synthetic:
+        data_dir = os.path.join(run_dir, "synthetic_data")
+        make_random_shard(data_dir, "train", 0, n_docs=64,
+                          doc_len=8 * args.block_size, vocab_size=50257, seed=0)
+        make_random_shard(data_dir, "val", 0, n_docs=16,
+                          doc_len=8 * args.block_size, vocab_size=50257, seed=1)
+        print(f"synthetic data in {data_dir} -- loss will not drop below chance")
+
+    B, T = args.batch_size, args.block_size
+    train_loader = DocSegmentLoader(data_dir, B, T, split="train")
+    val_loader = DocSegmentLoader(data_dir, B, T, split="val", shuffle=False)
+
+    assert args.total_batch_tokens % (B * T) == 0, \
+        "total-batch-tokens must be divisible by batch-size * block-size"
+    grad_accum = args.total_batch_tokens // (B * T)
+
+    # -- model ------------------------------------------------------------
+    cfg = variant(args.variant, block_size=T)
+    model = AMT(cfg).to(device)
+    fm = FlopModel(cfg)
+
+    print(f"\nvariant     : {args.variant}")
+    print(f"params      : {model.num_params():,} non-embedding")
+    print(f"layout      : trunk={cfg.n_trunk} mem_layer={cfg.mem_layer} "
+          f"adaptive={cfg.adaptive_layers} tail={cfg.n_dense_tail}")
+    print(f"grad accum  : {grad_accum} micro-steps of {B}x{T} = {args.total_batch_tokens} tokens/step")
+    print(fm.summary())
+    print()
+
+    if args.compile:
+        model = torch.compile(model)
+
+    bank = model.make_bank(B, device) if cfg.use_memory else None
+    optimizer = model.configure_optimizers(args.weight_decay, args.max_lr, device_type)
+    autocast = (torch.autocast(device_type=device_type, dtype=torch.bfloat16)
+                if device_type == "cuda" else nullcontext())
+
+    log_path = os.path.join(run_dir, "log.jsonl")
+    with open(os.path.join(run_dir, "config.json"), "w") as f:
+        json.dump({"args": vars(args), "config": cfg.to_dict(),
+                   "flops": fm.breakdown().as_dict()}, f, indent=2)
+
+    # -- loop -------------------------------------------------------------
+    for step in range(args.max_steps):
+        t0 = time.time()
+        last = step == args.max_steps - 1
+
+        dc = capacity_at(step, cfg.depth_capacity, args.max_steps)
+        mc = capacity_at(step, cfg.mem_capacity, args.max_steps)
+        set_capacity(model, dc, mc)
+        set_gate_floor(model, gate_floor_at(step, args.max_steps))
+        ent_w = cfg.lambda_entropy * max(0.0, 1.0 - step / (0.4 * args.max_steps))
+
+        if step % args.eval_every == 0 or last:
+            val_loss, val_stats = evaluate(model, val_loader, bank, device,
+                                           device_type, args.eval_steps)
+            print(f"  [eval] step {step} val_loss {val_loss:.4f} "
+                  f"ppl {math.exp(min(val_loss, 20)):.2f} "
+                  f"layers/tok {val_stats.get('layers_per_token', 0):.2f}")
+            with open(log_path, "a") as f:
+                f.write(json.dumps({"step": step, "split": "val",
+                                    "loss": val_loss, **val_stats}) + "\n")
+
+        optimizer.zero_grad(set_to_none=True)
+        acc = {"lm": 0.0, "aux": 0.0, "entropy": 0.0}
+        last_stats = {}
+        for micro in range(grad_accum):
+            x, y, reset = train_loader.next_batch()
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            # Clear BEFORE the forward: a flagged stream begins a new document with
+            # THIS batch, so clearing afterwards would let it retrieve from the
+            # previous one. See AMT.write_memory.
+            if bank is not None:
+                bank.clear(reset)
+            with autocast:
+                _, losses, stats, kv = model(x, targets=y, bank=bank,
+                                             entropy_weight=ent_w)
+            model.write_memory(bank, kv)
+            (losses["total"] / grad_accum).backward()
+            for k in acc:
+                acc[k] += losses[k].item() / grad_accum
+            last_stats = stats
+
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        lr = lr_at(step, args.max_lr, args.max_lr * args.min_lr_frac,
+                   args.warmup_steps, args.max_steps)
+        for g in optimizer.param_groups:
+            g["lr"] = lr * (0.1 if g.get("is_router") else 1.0)
+        optimizer.step()
+
+        if device_type == "cuda":
+            torch.cuda.synchronize()
+        dt = time.time() - t0
+        tps = args.total_batch_tokens / dt
+
+        if step % args.log_every == 0:
+            row = {"step": step, "split": "train", "loss": acc["lm"],
+                   "aux": acc["aux"], "entropy": acc["entropy"], "lr": lr,
+                   "grad_norm": float(norm), "depth_capacity": dc, "mem_capacity": mc,
+                   "dt_ms": dt * 1000, "tokens_per_sec": tps, **last_stats}
+            with open(log_path, "a") as f:
+                f.write(json.dumps(row) + "\n")
+            if step % max(args.log_every, 10) == 0:
+                print(f"step {step:5d} | loss {acc['lm']:.4f} | aux {acc['aux']:.3f} "
+                      f"| lr {lr:.2e} | norm {float(norm):.2f} "
+                      f"| cap {dc:.2f} | l/tok {last_stats.get('layers_per_token', 0):.2f} "
+                      f"| {dt*1000:.0f}ms | {tps:,.0f} tok/s")
+
+        if step > 0 and (step % args.ckpt_every == 0 or last):
+            torch.save({
+                "model": model.state_dict(), "config": cfg,
+                "optimizer": optimizer.state_dict(),
+                "loader": train_loader.state_dict(), "step": step, "args": vars(args),
+            }, os.path.join(run_dir, f"ckpt_{step:06d}.pt"))
+            print(f"  [ckpt] step {step}")
+
+    print(f"\ndone -> {run_dir}")
+
+
+if __name__ == "__main__":
+    main()
