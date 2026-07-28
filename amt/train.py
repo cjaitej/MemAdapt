@@ -12,6 +12,7 @@ aux-predictor agreement. Every one of those is logged every step from step 0.
 """
 
 import argparse
+import glob
 import json
 import math
 import os
@@ -141,6 +142,26 @@ def evaluate(model, loader, bank, device, device_type, steps=20, raw_model=None,
 # Main
 # ---------------------------------------------------------------------------
 
+def prune_checkpoints(run_dir, keep):
+    """Delete all but the `keep` most recent checkpoints in a run directory.
+
+    Called only after a successful save, so a crash mid-write can never leave the
+    directory empty: the file being replaced still exists until the new one is on
+    disk. `keep=0` disables pruning entirely.
+
+    Sorted by the step number in the filename rather than mtime -- a resumed run
+    rewrites earlier steps' files, and mtime would then rank them newest.
+    """
+    if keep <= 0:
+        return
+    ckpts = sorted(glob.glob(os.path.join(run_dir, "ckpt_*.pt")))
+    for stale in ckpts[:-keep]:
+        try:
+            os.remove(stale)
+        except OSError:
+            pass          # a locked or already-removed file is not worth failing on
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -164,6 +185,11 @@ def main():
     ap.add_argument("--eval-every", type=int, default=250)
     ap.add_argument("--eval-steps", type=int, default=20)
     ap.add_argument("--ckpt-every", type=int, default=2000)
+    ap.add_argument("--keep-ckpts", type=int, default=2,
+                    help="how many recent checkpoints to retain; older ones are "
+                         "deleted after a successful save. 0 keeps everything, which "
+                         "at ~0.26 GB each will exhaust Kaggle's 20 GB working dir "
+                         "over a full run. The final step's checkpoint is always kept")
     ap.add_argument("--log-every", type=int, default=1)
     ap.add_argument("--compile", action="store_true")
     ap.add_argument("--precision", choices=["auto", "bf16", "fp16", "fp32"],
@@ -348,6 +374,7 @@ def main():
                 "scaler": scaler.state_dict() if use_scaler else None,
             }, os.path.join(run_dir, f"ckpt_{step:06d}.pt"))
             print(f"  [ckpt] step {step}")
+            prune_checkpoints(run_dir, args.keep_ckpts)
 
     print(f"\ndone -> {run_dir}")
 
