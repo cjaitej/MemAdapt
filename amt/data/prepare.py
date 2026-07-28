@@ -82,13 +82,19 @@ def main():
                     help="drop shorter docs; must exceed block_size for memory to matter")
     ap.add_argument("--val-tokens", type=int, default=10_000_000)
     ap.add_argument("--tokenizer", default="gpt2")
+    ap.add_argument("--fineweb-config", default="sample-10BT",
+                    help="HuggingFaceFW/fineweb-edu config to stream. The default "
+                         "holds 10B tokens, but --min-doc-tokens discards most of "
+                         "them, so a large --shards can exhaust it; sample-100BT is "
+                         "the next size up")
     args = ap.parse_args()
 
     if args.dataset == "local" and not args.input_dir:
         ap.error("--dataset local requires --input-dir")
 
     enc, eot = get_tokenizer(args.tokenizer)
-    source = iter_local(args.input_dir) if args.dataset == "local" else iter_fineweb()
+    source = (iter_local(args.input_dir) if args.dataset == "local"
+              else iter_fineweb(args.fineweb_config))
 
     # The first shard is validation, the rest training -- matching fineweb.py.
     budgets = [("val", args.val_tokens)] + [("train", args.shard_tokens)] * args.shards
