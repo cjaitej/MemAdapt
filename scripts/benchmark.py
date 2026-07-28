@@ -83,11 +83,16 @@ def measure(name, B, T, steps, warmup, device, compile_model=False):
 
 
 def validate_flop_model(name, B, T, device):
-    """Compare the analytic forward FLOPs against torch's profiler.
+    """Compare the analytic forward matmul FLOPs against torch's profiler.
 
     The profiler counts only matmul/conv, which is exactly the convention flops.py
     uses, so the two should agree closely. A large gap means the analytic model is
     wrong and every reported efficiency number inherits the error.
+
+    Agreement here says the matmul accounting is right. It says nothing about total
+    cost: both sides of the comparison are blind to topk, gather and masked_fill,
+    which profiling puts at ~80% of the retrieval path's GPU time. That blind spot
+    is quantified in the traffic table below rather than hidden inside this ratio.
     """
     try:
         from torch.utils.flop_counter import FlopCounterMode
@@ -113,6 +118,40 @@ def validate_flop_model(name, B, T, device):
     return {"variant": name, "measured_mflops": measured / 1e6,
             "analytic_mflops": analytic / 1e6,
             "ratio": measured / analytic}
+
+
+def report_retrieval_traffic(names, T):
+    """The retrieval cost the table above structurally cannot show.
+
+    Printed next to the FLOP validation on purpose: a reader who sees ratio 1.027
+    and stops there will conclude the cost model is sound, when in fact both columns
+    omit the operations that dominate the memory path.
+    """
+    rows = []
+    for name in names:
+        cfg = variant(name, block_size=T)
+        if not cfg.use_memory:
+            continue
+        fm = FlopModel(cfg)
+        t = fm.retrieval_traffic()
+        rows.append((name, cfg, fm, t))
+    if not rows:
+        return
+
+    print("\nRetrieval work NOT counted above (bandwidth-bound; no meaningful FLOPs)")
+    print(f"{'variant':<16} {'KB/tok':>8} {'row (M)':>9} {'nbrs (k)':>9} "
+          f"{'FLOP/byte':>10}")
+    print("-" * 56)
+    for name, cfg, fm, t in rows:
+        mc = cfg.effective_mem_capacity
+        print(f"{name:<16} {mc * t.total / 1e3:>8.1f} "
+              f"{t.per_row / t.total:>8.0%} {t.per_neighbour / t.total:>9.0%} "
+              f"{fm.retrieval_intensity():>10.1f}")
+    c = rows[0][1]
+    print(f"\nrow terms scale with mem_size={c.mem_size}, neighbour terms with "
+          f"n_neighbors={c.n_neighbors}.")
+    print("Profiling puts ~80% of read()'s GPU time in these ops "
+          "(scripts/profile_memory.py).")
 
 
 def main():
@@ -156,7 +195,7 @@ def main():
         hours = 1e9 / base / 3600
         print(f"\nat b1_dense throughput, 1B tokens takes {hours:.1f} h")
 
-    print("\nFLOP model validation (forward, analytic vs profiler)")
+    print("\nFLOP model validation -- MATMUL/CONV ONLY (forward, analytic vs profiler)")
     print(f"{'variant':<16} {'measured':>10} {'analytic':>10} {'ratio':>7}")
     print("-" * 46)
     for name in a.variants:
@@ -166,6 +205,8 @@ def main():
             print(f"{v['variant']:<16} {v['measured_mflops']:>10.1f} "
                   f"{v['analytic_mflops']:>10.1f} {v['ratio']:>7.3f}{flag}")
         torch.cuda.empty_cache() if device == "cuda" else None
+
+    report_retrieval_traffic(a.variants, a.block_size)
 
 
 if __name__ == "__main__":
