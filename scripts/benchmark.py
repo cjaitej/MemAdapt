@@ -96,7 +96,8 @@ def validate_flop_model(name, B, T, device):
 
     cfg = variant(name, block_size=T)
     model = AMT(cfg).to(device).eval()
-    bank = model.make_bank(B, device) if cfg.use_memory else None
+    amp_dtype, _, _ = select_precision(device, verbose=False)
+    bank = model.make_bank(B, device, dtype=amp_dtype) if cfg.use_memory else None
     x = torch.randint(0, cfg.vocab_size, (B, T), device=device)
 
     if bank is not None:  # warm the bank so retrieval is actually exercised

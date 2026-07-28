@@ -38,7 +38,12 @@ class AMTConfig:
     # ---- memory ----------------------------------------------------------
     mem_size: int = 2048          # M: FIFO bank entries per batch element
     n_neighbors: int = 32         # k in kNN
-    mem_query_chunk: int = 128    # query-chunk size for the kNN scan (VRAM control)
+    # Query-chunk size for the kNN scan, trading VRAM for bandwidth: every chunk
+    # re-streams the whole normalised bank (B*H*M*head_dim), so 4 chunks read it 4
+    # times. 512 covers a full segment in one pass; the resulting (B, H, T, M)
+    # similarity tensor is ~200 MB at B=16 in fp16, which is affordable anywhere the
+    # model itself fits. Lower it if a larger mem_size pushes that out of VRAM.
+    mem_query_chunk: int = 512
     mem_gate_init: float = -2.0   # gate bias init; sigmoid(-2) ~ 0.12 (risk R2)
 
     # ---- loss weights ----------------------------------------------------

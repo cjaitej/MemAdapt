@@ -16,6 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+from ..precision import select_precision
 from .blocks import AdaptiveBlock, Block, MemoryBlock
 from .config import AMTConfig
 from .memory import KVMemoryBank
@@ -85,8 +86,19 @@ class AMT(nn.Module):
 
     # -- memory plumbing ---------------------------------------------------
 
-    def make_bank(self, batch_size, device, dtype=torch.bfloat16) -> KVMemoryBank:
+    def make_bank(self, batch_size, device, dtype=None) -> KVMemoryBank:
+        """Allocate the KV bank, defaulting to this device's autocast dtype.
+
+        Not a hardcoded bf16 default any more. The bank's normalised keys are one
+        operand of the kNN similarity matmul, so a bank dtype that disagrees with
+        the autocast dtype moves that matmul off the tensor-core path silently --
+        and bf16 on a pre-Ampere card is emulated, which is the worst case of all.
+        """
         c = self.config
+        if dtype is None:
+            dev = str(device)
+            dtype, _, _ = select_precision(
+                "cuda" if dev.startswith("cuda") else "cpu", verbose=False)
         return KVMemoryBank(batch_size, c.n_head, c.head_dim, c.mem_size, device, dtype)
 
     # -- forward -----------------------------------------------------------

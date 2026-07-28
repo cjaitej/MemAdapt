@@ -45,8 +45,14 @@ class KVMemoryBank:
         # read. Normalising the whole bank on every forward pass allocated and wrote
         # a full float32 copy of it each step, which measured as a larger cost than
         # the entire kNN search it was preparing for.
+        #
+        # Stored in the bank dtype, not float32. The normalisation itself is still
+        # computed in fp32 at write time (see `write`), so this only rounds the
+        # result; what it buys is that the similarity matmul in `read` runs in the
+        # autocast dtype and therefore on tensor cores. See `read` for why that is
+        # worth several percent of end-to-end throughput on Turing.
         self.keys_norm = torch.zeros(batch_size, n_head, capacity, head_dim,
-                                     device=device, dtype=torch.float32)
+                                     device=device, dtype=dtype)
         # `fill` counts valid entries (saturates at capacity); `ptr` is the write head.
         self.fill = torch.zeros(batch_size, device=device, dtype=torch.long)
         self.ptr = torch.zeros(batch_size, device=device, dtype=torch.long)
@@ -115,7 +121,9 @@ class KVMemoryBank:
 
         self.keys.scatter_(2, idx, k)
         self.values.scatter_(2, idx, v)
-        self.keys_norm.scatter_(2, idx, F.normalize(k.float(), dim=-1))
+        # Normalise in fp32 and store rounded: the division is the part that needs
+        # the range, the stored unit vector does not.
+        self.keys_norm.scatter_(2, idx, F.normalize(k.float(), dim=-1).to(self.dtype))
 
         self.ptr = (self.ptr + T) % self.capacity
         self.fill = torch.clamp(self.fill + T, max=self.capacity)
@@ -155,6 +163,19 @@ class KVMemoryBank:
         would dominate VRAM, so the search runs under no_grad in chunks and only the
         top-k similarities -- B x H x Tq x k, four orders of magnitude smaller -- are
         recomputed with grad so the query still learns.
+
+        PRECISION: the search runs in the bank dtype (the autocast dtype), not fp32.
+        This is a throughput decision, and it is hardware-shaped. The similarity
+        matmul is ~98% of the memory path's FLOPs, and in fp32 it lands on tensor
+        cores only where TF32 exists -- Ampere and later. On Turing (T4) there is no
+        TF32 unit, so an fp32 matmul falls back to the FP32 CUDA cores while every
+        other matmul in the model is on fp16 tensor cores, which measured as the
+        memory path costing 14% of wall-clock for 2% of FLOPs.
+
+        Accuracy is not the tradeoff it looks like: these are cosine similarities in
+        [-1, 1], fp16 matmul accumulates in fp32 on tensor cores, and the gradient
+        path (`sim_live` below) and the softmax were already outside this matmul. The
+        fp32 was only buying ranking precision in the top-k select.
         """
         B, H, Tq, D = q.shape
         assert B == self.B and H == self.n_head and D == self.head_dim
@@ -170,7 +191,9 @@ class KVMemoryBank:
             qc = qn[:, :, s:e]                                    # (B, H, t, D)
 
             with torch.no_grad():
-                sim = torch.matmul(qc.float(), keys_n.transpose(-1, -2))   # (B, H, t, M)
+                # Same dtype on both operands or cuBLAS refuses the tensor-core path.
+                sim = torch.matmul(qc.to(keys_n.dtype),
+                                   keys_n.transpose(-1, -2))              # (B, H, t, M)
                 # -1e4 rather than -inf: an empty bank masks every slot, and a full row
                 # of -inf makes softmax emit NaN. A large finite floor stays defined;
                 # empty-bank streams are zeroed out below anyway.
@@ -188,7 +211,9 @@ class KVMemoryBank:
 
             attn = F.softmax(sim_live.float() / temperature, dim=-1).to(v_vec.dtype)
             y_parts.append(torch.einsum("bhtk,bhtkd->bhtd", attn, v_vec))
-            conf_parts.append(top_sim[..., 0].mean(dim=1))        # (B, t) over heads
+            # fp32 for the head-mean: conf feeds the depth router (the C1 coupling),
+            # so it keeps its fp32 contract regardless of what the search ran in.
+            conf_parts.append(top_sim[..., 0].float().mean(dim=1))  # (B, t) over heads
 
         y_mem = torch.cat(y_parts, dim=2)
         conf = torch.cat(conf_parts, dim=1).clamp(-1.0, 1.0)
