@@ -138,23 +138,32 @@ def generate(model, cfg, enc, args, device, bank):
         per_token[mod.name].append(float(out["mask"][:, -1].float().mean()))
 
     handles = [r.register_forward_hook(hook) for r in routers_of(model)]
+    ids = enc.encode(args.prompt)
+    n_bad, n_new = 0, 0
     try:
-        ids = enc.encode(args.prompt)
-        idx = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
-        gen = torch.Generator(device=device).manual_seed(args.seed)
-        out = model.generate(idx, args.max_new_tokens, temperature=args.temperature,
-                             top_k=args.top_k, bank=bank, generator=gen)
+        for i in range(args.num_samples):
+            idx = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
+            # Distinct seed per sample: reusing one makes every sample identical and
+            # makes a degenerate model look deceptively consistent.
+            gen = torch.Generator(device=device).manual_seed(args.seed + i)
+            out = model.generate(idx, args.max_new_tokens,
+                                 temperature=args.temperature, top_k=args.top_k,
+                                 bank=bank, generator=gen)
+
+            new = out[0, len(ids):].tolist()
+            n_bad += sum(1 for t in new if t >= GPT2_VOCAB)
+            n_new += len(new)
+            text = enc.decode([t for t in new if t < GPT2_VOCAB])
+            label = (f" sample {i + 1}/{args.num_samples} "
+                     if args.num_samples > 1 else " ")
+            print(f"\n{('-' * 8) + label:-<70}\n{args.prompt}{text}")
     finally:
         for h in handles:
             h.remove()
+    print("-" * 70)
 
-    new = out[0, len(ids):].tolist()
-    bad = [t for t in new if t >= GPT2_VOCAB]
-    text = enc.decode([t for t in new if t < GPT2_VOCAB])
-
-    print(f"\n{'-' * 70}\n{args.prompt}{text}\n{'-' * 70}")
-    if bad:
-        print(f"note: {len(bad)}/{len(new)} sampled ids were in the padded vocab "
+    if n_bad:
+        print(f"note: {n_bad}/{n_new} sampled ids were in the padded vocab "
               f"({GPT2_VOCAB}-{cfg.vocab_size-1}) and were dropped on decode. "
               f"Expected early in training; persistent means the head has mass on "
               f"tokens that never occur.")
@@ -211,6 +220,8 @@ def main():
                         "before generating. Without it a memory variant retrieves "
                         "from an empty bank and the memory half does nothing")
     g.add_argument("--max-new-tokens", type=int, default=200)
+    g.add_argument("--num-samples", type=int, default=4,
+                   help="one sample says little about a model; each uses seed+i")
     g.add_argument("--temperature", type=float, default=0.8)
     g.add_argument("--top-k", type=int, default=50)
     g.add_argument("--seed", type=int, default=1337)
