@@ -36,7 +36,7 @@ def select_precision(device_type="cuda", prefer=None, verbose=True):
 
     cap = torch.cuda.get_device_capability(0)
     name = torch.cuda.get_device_name(0)
-    bf16_ok = cap[0] >= 8 and torch.cuda.is_bf16_supported()
+    bf16_ok = bf16_supported()
 
     if prefer == "fp32":
         dtype, scaler, label = torch.float32, False, "fp32 (forced)"
@@ -70,11 +70,24 @@ def make_scaler(use_scaler):
     return torch.amp.GradScaler("cuda", enabled=bool(use_scaler))
 
 
+def bf16_supported():
+    """True only where bf16 runs on hardware, not via emulation.
+
+    `torch.cuda.is_bf16_supported()` alone is not enough: recent PyTorch returns True
+    on pre-Ampere cards because it counts an emulation path. Reporting that as "bf16"
+    on a T4 or P100 contradicts what `select_precision` actually picks, so both go
+    through the same cc >= 8.0 rule.
+    """
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability(0)[0] >= 8 and torch.cuda.is_bf16_supported()
+
+
 def describe_device():
     if not torch.cuda.is_available():
         return "cpu"
     cap = torch.cuda.get_device_capability(0)
     total = torch.cuda.get_device_properties(0).total_memory / 1e9
     return (f"{torch.cuda.get_device_name(0)} | cc {cap[0]}.{cap[1]} | "
-            f"{total:.1f} GB | bf16={torch.cuda.is_bf16_supported()} | "
+            f"{total:.1f} GB | bf16={bf16_supported()} | "
             f"gpus={torch.cuda.device_count()}")
