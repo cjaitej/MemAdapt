@@ -23,6 +23,23 @@ from .memory import KVMemoryBank
 from .routers import TopKTokenRouter
 
 
+def strip_compile_prefix(state_dict):
+    """Drop the `_orig_mod.` prefix torch.compile adds to every key.
+
+    `torch.compile` returns an OptimizedModule wrapper, and its `state_dict()`
+    namespaces the real module underneath it. A checkpoint saved from the compiled
+    handle therefore cannot be loaded into a plain AMT -- which is every consumer:
+    resuming training, inference, analysis.
+
+    Kept tolerant rather than strict because checkpoints written before this was
+    fixed still carry the prefix, and a run that was interrupted mid-experiment is
+    exactly when reloading matters most.
+    """
+    if not any(k.startswith("_orig_mod.") for k in state_dict):
+        return state_dict
+    return {k.removeprefix("_orig_mod."): v for k, v in state_dict.items()}
+
+
 def stats_to_floats(stats):
     """Convert the tensor telemetry from AMT.forward into plain floats.
 

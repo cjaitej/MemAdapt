@@ -38,6 +38,7 @@ sys.path.insert(0, ".")
 
 from amt.data import DocSegmentLoader  # noqa: E402
 from amt.model import AMT  # noqa: E402
+from amt.model.amt import strip_compile_prefix  # noqa: E402
 from amt.model.routers import TopKTokenRouter  # noqa: E402
 from amt.precision import describe_device, select_precision  # noqa: E402
 from amt.train import evaluate  # noqa: E402
@@ -60,7 +61,7 @@ def load_model(path, device):
     ck = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg = ck["config"]
     model = AMT(cfg).to(device).eval()
-    model.load_state_dict(ck["model"])
+    model.load_state_dict(strip_compile_prefix(ck["model"]))
     print(f"loaded      : {os.path.basename(ckpt_path)} (step {ck.get('step', '?')})")
     print(f"variant     : {ck.get('args', {}).get('variant', '?')}  "
           f"params {model.num_params()/1e6:.2f}M non-embedding")

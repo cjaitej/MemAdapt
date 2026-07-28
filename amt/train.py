@@ -23,7 +23,7 @@ import torch
 
 from amt.data import DocSegmentLoader, make_random_shard
 from amt.model import AMT, FlopModel, TopKTokenRouter, variant
-from amt.model.amt import stats_to_floats
+from amt.model.amt import stats_to_floats, strip_compile_prefix
 from amt.model.blocks import MemoryBlock
 from amt.precision import describe_device, make_scaler, select_precision
 
@@ -276,7 +276,7 @@ def main():
                 raise FileNotFoundError(f"--resume latest: no ckpt_*.pt in {run_dir}")
             ckpt_path = os.path.join(run_dir, found[-1])
         ck = torch.load(ckpt_path, map_location=device, weights_only=False)
-        raw_model.load_state_dict(ck["model"])
+        raw_model.load_state_dict(strip_compile_prefix(ck["model"]))
         optimizer.load_state_dict(ck["optimizer"])
         train_loader.load_state_dict(ck["loader"])
         if ck.get("scaler") is not None:
@@ -368,7 +368,10 @@ def main():
 
         if step > 0 and (step % args.ckpt_every == 0 or last):
             torch.save({
-                "model": model.state_dict(), "config": cfg,
+                # raw_model, not model: under --compile the latter is an
+                # OptimizedModule whose state_dict prefixes every key with
+                # `_orig_mod.`, which nothing downstream can load into a plain AMT.
+                "model": raw_model.state_dict(), "config": cfg,
                 "optimizer": optimizer.state_dict(),
                 "loader": train_loader.state_dict(), "step": step, "args": vars(args),
                 "scaler": scaler.state_dict() if use_scaler else None,

@@ -44,6 +44,7 @@ sys.path.insert(0, ".")
 
 from amt.data import DocSegmentLoader  # noqa: E402
 from amt.model import AMT, FlopModel  # noqa: E402
+from amt.model.amt import strip_compile_prefix  # noqa: E402
 from amt.model.routers import TopKTokenRouter  # noqa: E402
 from amt.precision import select_precision  # noqa: E402
 
@@ -162,7 +163,7 @@ def print_table(runs):
 def build(run_dir, device):
     ck = torch.load(latest_ckpt(run_dir), map_location=device, weights_only=False)
     model = AMT(ck["config"]).to(device).eval()
-    model.load_state_dict(ck["model"])
+    model.load_state_dict(strip_compile_prefix(ck["model"]))
     return model, ck["config"]
 
 
