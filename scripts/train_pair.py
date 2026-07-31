@@ -51,7 +51,12 @@ def gpu_count():
 
 
 def build(variant, run_name, gpu, args, passthrough):
-    cmd = [sys.executable, "-m", "amt.train",
+    # -u matters. A child's stdout is a pipe here, not a terminal, so Python
+    # block-buffers it (~8KB) and nothing appears until the buffer fills or the
+    # process exits -- which for a training run means hours of apparent silence
+    # followed by everything at once. Popen's bufsize=1 does not help: it line-buffers
+    # the parent's reading side, not the child's writing side.
+    cmd = [sys.executable, "-u", "-m", "amt.train",
            "--variant", variant,
            "--run-name", run_name,
            "--data-dir", args.data_dir,
@@ -71,6 +76,8 @@ def child_env(gpu, run_dir):
     # The child sees one card, numbered 0. train.py asks for "cuda" and gets the one
     # we chose, with no device-selection code in the trainer.
     env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    # Belt and braces with `-u`: this also reaches anything the child spawns.
+    env["PYTHONUNBUFFERED"] = "1"
     # Separate inductor caches. Two processes compiling the same graph at the same
     # moment otherwise race on one cache directory, and the failure mode is a
     # corrupted entry that only shows up as a compile error on a later run.
@@ -78,12 +85,29 @@ def child_env(gpu, run_dir):
     return env
 
 
-def pump(proc, name, log_path, width):
+def pump(proc, name, log_path, width, seen):
     """Stream a child's output to the console (prefixed) and to its own log file."""
     with open(log_path, "w", encoding="utf-8", buffering=1) as log:
         for line in proc.stdout:
             log.write(line)
+            seen[name] = time.perf_counter()
             print(f"[{name:<{width}}] {line.rstrip()}", flush=True)
+
+
+def heartbeat(seen, stop, width, every=120):
+    """Say a quiet child is still alive.
+
+    `torch.compile` spends minutes producing nothing before the first step prints, so
+    silence is normal and indistinguishable from a hang -- and after a buffering bug
+    that made silence the default, it should never be ambiguous again.
+    """
+    while not stop.wait(every):
+        now = time.perf_counter()
+        for name, last in sorted(seen.items()):
+            quiet = now - last
+            if quiet >= every:
+                print(f"[{name:<{width}}] ... alive, {quiet/60:.0f} min since its last "
+                      "line (compiling?)", flush=True)
 
 
 def main():
@@ -139,8 +163,11 @@ def main():
 
     width = max(len(n) for _, n, _, _, _ in jobs)
     procs, threads = [], []
+    seen, stop = {}, threading.Event()
     started = time.perf_counter()
     try:
+        beat = threading.Thread(target=heartbeat, args=(seen, stop, width), daemon=True)
+        beat.start()
         for variant, name, gpu, run_dir, cmd in jobs:
             # Created here, not while planning, so --dry-run touches nothing.
             os.makedirs(run_dir, exist_ok=True)
@@ -150,7 +177,8 @@ def main():
                                     stderr=subprocess.STDOUT,
                                     text=True, bufsize=1)
             procs.append((name, proc))
-            t = threading.Thread(target=pump, args=(proc, name, log_path, width),
+            seen[name] = time.perf_counter()
+            t = threading.Thread(target=pump, args=(proc, name, log_path, width, seen),
                                  daemon=True)
             t.start()
             threads.append(t)
@@ -167,6 +195,8 @@ def main():
         for _, proc in procs:
             proc.wait()
         return 130
+    finally:
+        stop.set()
 
     mins = (time.perf_counter() - started) / 60
     print(f"\nfinished in {mins:.1f} min")
