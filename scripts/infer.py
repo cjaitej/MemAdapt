@@ -46,23 +46,33 @@ from amt.train import evaluate  # noqa: E402
 GPT2_VOCAB = 50257          # real BPE size; the config pads this to 50304
 
 
-def resolve_ckpt(path):
-    """Accept a run directory or a checkpoint file."""
+def resolve_ckpt(path, prefer_best=True):
+    """Accept a run directory or a checkpoint file.
+
+    Prefers `best.pt` when a run directory is given: the newest periodic checkpoint
+    is whatever step training happened to stop at, which is rarely the one you want
+    to evaluate. Pass the file path explicitly to override.
+    """
     if os.path.isfile(path):
         return path
+    best = os.path.join(path, "best.pt")
+    if prefer_best and os.path.exists(best):
+        return best
     ckpts = sorted(glob.glob(os.path.join(path, "ckpt_*.pt")))
     if not ckpts:
-        raise FileNotFoundError(f"no ckpt_*.pt in {path}")
+        raise FileNotFoundError(f"no best.pt or ckpt_*.pt in {path}")
     return ckpts[-1]
 
 
-def load_model(path, device):
-    ckpt_path = resolve_ckpt(path)
+def load_model(path, device, prefer_best=True):
+    ckpt_path = resolve_ckpt(path, prefer_best)
     ck = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg = ck["config"]
     model = AMT(cfg).to(device).eval()
     model.load_state_dict(strip_compile_prefix(ck["model"]))
-    print(f"loaded      : {os.path.basename(ckpt_path)} (step {ck.get('step', '?')})")
+    val = ck.get("val_loss")
+    print(f"loaded      : {os.path.basename(ckpt_path)} (step {ck.get('step', '?')}"
+          + (f", val_loss {val:.4f}" if val is not None else "") + ")")
     print(f"variant     : {ck.get('args', {}).get('variant', '?')}  "
           f"params {model.num_params()/1e6:.2f}M non-embedding")
     return model, cfg, ck
@@ -209,6 +219,8 @@ def main():
     common.add_argument("--batch-size", type=int, default=4)
     common.add_argument("--no-calibrate", action="store_true",
                         help="trust the checkpoint's saved thresholds")
+    common.add_argument("--last", action="store_true",
+                        help="use the newest periodic checkpoint instead of best.pt")
 
     e = sub.add_parser("eval", parents=[common], help="val loss and routing telemetry")
     e.add_argument("--eval-steps", type=int, default=40)
@@ -229,7 +241,7 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device      : {describe_device()}")
-    model, cfg, _ = load_model(args.run, device)
+    model, cfg, _ = load_model(args.run, device, prefer_best=not args.last)
 
     amp_dtype, _, _ = select_precision(device, verbose=False)
     # Generation runs one sequence; eval runs a batch. The bank is allocated for a

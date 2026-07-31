@@ -10,6 +10,8 @@ These tests pin both halves: the prefix is stripped on load, and training saves 
 unwrapped module in the first place.
 """
 
+import os
+
 import torch
 
 from amt.model import AMT, variant
@@ -48,6 +50,43 @@ def test_a_compiled_checkpoint_loads_into_a_plain_model():
     fresh.load_state_dict(strip_compile_prefix(as_saved))
     for a, b in zip(trained.state_dict().values(), fresh.state_dict().values()):
         assert torch.equal(a, b)
+
+
+def test_best_checkpoint_is_not_named_like_a_periodic_one(tmp_path):
+    """`best.pt`, never `ckpt_best.pt` -- two things break if it matches the glob.
+
+    `--resume latest` takes the lexicographically last `ckpt_*.pt`, and "best" sorts
+    after every zero-padded step number, so a resumed run would silently rewind to
+    the best checkpoint instead of continuing from the newest. It would also consume
+    a slot in the pruner's retention window, evicting a real checkpoint.
+    """
+    from amt.train import prune_checkpoints
+
+    for step in (500, 1000, 1500):
+        (tmp_path / f"ckpt_{step:06d}.pt").write_bytes(b"x")
+    (tmp_path / "best.pt").write_bytes(b"x")
+
+    prune_checkpoints(str(tmp_path), keep=2)
+
+    survivors = sorted(p.name for p in tmp_path.glob("*.pt"))
+    assert survivors == ["best.pt", "ckpt_001000.pt", "ckpt_001500.pt"], (
+        "pruning must keep the last `keep` periodic checkpoints AND best.pt"
+    )
+
+    # The `--resume latest` selection, reproduced exactly.
+    found = sorted(f for f in os.listdir(tmp_path) if f.startswith("ckpt_"))
+    assert found[-1] == "ckpt_001500.pt", "resume must pick the newest step"
+
+
+def test_best_checkpoint_carries_no_optimizer_state():
+    """It is for evaluation, not resuming; optimizer moments would triple its size."""
+    import inspect
+
+    from amt import train
+    src = inspect.getsource(train.main)
+    best_save = src.split('-> best.pt')[0].split('if val_loss < best_val:')[-1]
+    assert '"optimizer"' not in best_save
+    assert '"val_loss": val_loss' in best_save
 
 
 def test_training_saves_the_unwrapped_module():

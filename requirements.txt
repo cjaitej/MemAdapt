@@ -17,3 +17,6 @@ datasets>=2.20
 # Optional: transformers is used by GPT.from_pretrained for the retrofit demo
 transformers>=4.40
 matplotlib>=3.8
+
+# Only needed by scripts/app.py, the checkpoint playground
+streamlit>=1.40

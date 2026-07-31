@@ -268,6 +268,7 @@ def main():
                 if device_type == "cuda" else nullcontext())
 
     start_step = 0
+    best_val = float("inf")
     if args.resume:
         ckpt_path = args.resume
         if ckpt_path == "latest":
@@ -282,7 +283,11 @@ def main():
         if ck.get("scaler") is not None:
             scaler.load_state_dict(ck["scaler"])
         start_step = ck["step"] + 1
-        print(f"resumed from {ckpt_path} at step {start_step}")
+        # Carry the best-so-far across the resume. Restarting it at infinity would
+        # let the first eval after a resume overwrite best.pt with a worse model.
+        best_val = ck.get("best_val", float("inf"))
+        print(f"resumed from {ckpt_path} at step {start_step}"
+              + (f" (best val {best_val:.4f})" if best_val < float("inf") else ""))
 
     log_path = os.path.join(run_dir, "log.jsonl")
     with open(os.path.join(run_dir, "config.json"), "w") as f:
@@ -316,6 +321,23 @@ def main():
             with open(log_path, "a") as f:
                 f.write(json.dumps({"step": step, "split": "val",
                                     "loss": val_loss, **val_stats}) + "\n")
+
+            if val_loss < best_val:
+                best_val = val_loss
+                # Named best.pt, NOT ckpt_best.pt: `--resume latest` picks the
+                # lexicographically last ckpt_*.pt, and "best" sorts after every
+                # zero-padded step, so a ckpt_ name would silently rewind training
+                # to the best checkpoint instead of the newest one. It would also
+                # occupy a slot in prune_checkpoints' retention window.
+                #
+                # No optimizer or loader state either: this file is for evaluation
+                # and inference, and carrying them would triple its size for
+                # something resume already gets from the step checkpoints.
+                torch.save({"model": raw_model.state_dict(), "config": cfg,
+                            "step": step, "val_loss": val_loss,
+                            "args": vars(args)},
+                           os.path.join(run_dir, "best.pt"))
+                print(f"  [best] val_loss {val_loss:.4f} -> best.pt")
 
         optimizer.zero_grad(set_to_none=True)
         acc = {"lm": 0.0, "aux": 0.0, "entropy": 0.0}
@@ -375,6 +397,7 @@ def main():
                 "optimizer": optimizer.state_dict(),
                 "loader": train_loader.state_dict(), "step": step, "args": vars(args),
                 "scaler": scaler.state_dict() if use_scaler else None,
+                "best_val": best_val,
             }, os.path.join(run_dir, f"ckpt_{step:06d}.pt"))
             print(f"  [ckpt] step {step}")
             prune_checkpoints(run_dir, args.keep_ckpts)

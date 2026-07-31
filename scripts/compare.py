@@ -53,10 +53,19 @@ from amt.precision import select_precision  # noqa: E402
 # Reading a run
 # ---------------------------------------------------------------------------
 
-def latest_ckpt(run_dir):
+def latest_ckpt(run_dir, prefer_best=True):
+    """`best.pt` when there is one, else the newest periodic checkpoint.
+
+    Comparing variants at each one's *best* validation loss is the fair reading:
+    the last periodic checkpoint is whatever step the run happened to stop at, which
+    is an arbitrary and possibly unequal handicap across variants.
+    """
+    best = os.path.join(run_dir, "best.pt")
+    if prefer_best and os.path.exists(best):
+        return best
     ckpts = sorted(glob.glob(os.path.join(run_dir, "ckpt_*.pt")))
     if not ckpts:
-        raise FileNotFoundError(f"no ckpt_*.pt in {run_dir}")
+        raise FileNotFoundError(f"no best.pt or ckpt_*.pt in {run_dir}")
     return ckpts[-1]
 
 
