@@ -97,24 +97,85 @@ class DocSegmentLoader:
         for b in range(self.B):               # _assign updates the state above
             self._assign(b)
 
+    def tokens_per_epoch(self):
+        """Trainable tokens in one pass over every shard, after this loader's filtering.
+
+        Deliberately not the raw corpus size. Two things shrink it, both depending on
+        T, which is why an "epoch" cannot be derived from the file sizes alone:
+
+        * documents shorter than T+1 are skipped entirely (`_load_shard`), and
+        * each document's trailing partial segment is dropped rather than padded, so
+          that no batch ever mixes tokens from two documents (`next_batch`).
+
+        Reads only the offsets files, which are a few hundred KB per shard.
+
+        Counts the whole corpus, not this rank's share; under DDP each rank sees
+        roughly 1/world of it.
+        """
+        total = 0
+        for tok_path in self.shard_paths:
+            offsets = np.load(tok_path.replace("_tokens.npy", "_offsets.npy"))
+            lengths = np.diff(offsets.astype(np.int64))
+            lengths = lengths[lengths >= self.T + 1]
+            total += int(((lengths - 1) // self.T).sum()) * self.T
+        return total
+
     def _next_shard(self):
+        """Advance to the next shard, re-parking EVERY stream into it.
+
+        All B streams must move together. Only one shard's tokens are resident, so
+        `_load_shard` replaces `tokens`, `doc_starts`, `doc_ends` and `doc_order`
+        wholesale -- after which any stream still holding an index or offset from the
+        previous shard is pointing at nothing meaningful.
+
+        Reassigning only the stream that exhausted the cursor left the other B-1
+        stale, and the two ways that went wrong were very different:
+
+        * new shard has fewer documents -> IndexError on `doc_ends[stream_doc[b]]`,
+          which at least fails loudly;
+        * new shard has more -> a valid index into an unrelated document, read at a
+          token offset computed for the old shard. No error, just wrong text fed to
+          the model until that stream happened to roll over.
+
+        The second is why this is fixed rather than guarded: shard boundaries recur
+        every ~1.5k steps at B=32, so the silent case was corrupting a slice of every
+        run long before any of them crashed.
+        """
+        # Tails of the in-flight documents are lost. That is ~B documents per
+        # boundary -- under 0.1% of a 100M-token shard -- and the alternative is
+        # keeping two shards resident to let stragglers finish.
+        for b in range(self.B):
+            end = int(self.doc_ends[self.stream_doc[b]])
+            self.tokens_dropped += max(0, end - int(self.stream_pos[b]))
+
         self.shard_idx += 1
         if self.shard_idx >= len(self.shard_paths):
             self.shard_idx = 0
             self.epoch += 1
         self._load_shard(self.shard_idx)
         self.cursor = 0
+        for b in range(self.B):
+            self._park(b)
 
-    def _assign(self, b):
-        """Park stream b on the next document."""
-        if self.cursor >= len(self.doc_order):
-            self._next_shard()
+    def _park(self, b):
+        """Point stream b at the next document of the CURRENT shard.
+
+        The caller guarantees the cursor is in range; `_assign` is the entry point
+        that handles exhaustion.
+        """
         d = self.doc_order[self.cursor]
         self.cursor += 1
         self.stream_doc[b] = d
         self.stream_pos[b] = self.doc_starts[d]
         self.stream_fresh[b] = True
         self.docs_consumed += 1
+
+    def _assign(self, b):
+        """Park stream b on the next document, rolling to the next shard if needed."""
+        if self.cursor >= len(self.doc_order):
+            self._next_shard()          # re-parks every stream, b included
+            return
+        self._park(b)
 
     # -- iteration ---------------------------------------------------------
 

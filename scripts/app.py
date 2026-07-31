@@ -11,11 +11,12 @@ Sampling deliberately calls `AMT.generate` one token at a time rather than
 reimplementing the loop. There is no KV cache in this model -- `generate` re-runs the
 forward over the whole context every step regardless -- so a 1-token call costs
 exactly what one iteration of its own loop costs, and the sampling logic stays in one
-place. The `torch.Generator` is created once and threaded through, or every token
-would be drawn from the same seed.
+place. The `torch.Generator` is created once per sample and threaded through, or every
+token would be drawn from the same seed.
 """
 
 import glob
+import html
 import os
 import sys
 
@@ -28,11 +29,39 @@ from amt.data import DocSegmentLoader  # noqa: E402
 from amt.model import AMT, FlopModel  # noqa: E402
 from amt.model.amt import strip_compile_prefix  # noqa: E402
 from amt.model.routers import TopKTokenRouter  # noqa: E402
-from amt.precision import describe_device, select_precision  # noqa: E402
+from amt.precision import select_precision  # noqa: E402
 
 GPT2_VOCAB = 50257
 
-st.set_page_config(page_title="AMT playground", layout="wide")
+st.set_page_config(page_title="AMT playground", page_icon="🧠", layout="centered")
+
+# Styling stays theme-agnostic: opacity and borders rather than fixed colours, so it
+# reads correctly whether the viewer is in Streamlit's light or dark theme.
+st.markdown("""
+<style>
+  .block-container { padding-top: 2.5rem; max-width: 52rem; }
+  .chips { display: flex; flex-wrap: wrap; gap: .4rem; margin: -.5rem 0 1.4rem; }
+  .chip {
+    font-size: .74rem; padding: .18rem .55rem; border-radius: 1rem;
+    border: 1px solid currentColor; opacity: .55; white-space: nowrap;
+  }
+  .chip.key { opacity: .95; font-weight: 600; }
+  .sample-head {
+    font-size: .7rem; text-transform: uppercase; letter-spacing: .09em;
+    opacity: .45; margin-bottom: .35rem;
+  }
+  .sample {
+    font-size: .95rem; line-height: 1.75; white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .sample .prompt { opacity: .45; }
+  .caret {
+    display: inline-block; width: .5em; opacity: .5;
+    animation: blink 1s steps(2, start) infinite;
+  }
+  @keyframes blink { to { visibility: hidden; } }
+</style>
+""", unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
@@ -45,7 +74,7 @@ def load(ckpt_path, device):
     cfg = ck["config"]
     model = AMT(cfg).to(device).eval()
     model.load_state_dict(strip_compile_prefix(ck["model"]))
-    return model, cfg, ck.get("step", 0), ck.get("args", {})
+    return model, cfg, ck
 
 
 @st.cache_resource
@@ -60,7 +89,8 @@ def find_checkpoints(root="runs"):
     The best checkpoint is almost always the one worth looking at, so it should not
     be buried below whichever step a run happened to stop at.
     """
-    by_mtime = lambda ps: sorted(ps, key=os.path.getmtime, reverse=True)  # noqa: E731
+    def by_mtime(paths):
+        return sorted(paths, key=os.path.getmtime, reverse=True)
     return (by_mtime(glob.glob(os.path.join(root, "*", "best.pt")))
             + by_mtime(glob.glob(os.path.join(root, "*", "ckpt_*.pt"))))
 
@@ -113,11 +143,18 @@ def stream(model, enc, prompt, n_tokens, temperature, top_k, seed, bank, device,
             # one BPE token at a time splits multi-byte characters into replacement
             # chars, which looks like a model defect and is not one.
             text = enc.decode([t for t in emitted if t < GPT2_VOCAB])
-            yield text[len(shown):]
+            yield text[len(shown):], sum(1 for t in emitted if t >= GPT2_VOCAB)
             shown = text
     finally:
         for h in handles:
             h.remove()
+
+
+def render(slot, prompt, body, done=False):
+    caret = "" if done else '<span class="caret">▍</span>'
+    slot.markdown(
+        f'<div class="sample"><span class="prompt">{html.escape(prompt)}</span>'
+        f'{html.escape(body)}{caret}</div>', unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
@@ -127,74 +164,86 @@ def stream(model, enc, prompt, n_tokens, temperature, top_k, seed, bank, device,
 device = "cuda" if torch.cuda.is_available() else "cpu"
 ckpts = find_checkpoints()
 
-st.title("AMT playground")
-
 if not ckpts:
-    st.error("No checkpoints found under `runs/`. Train something, or copy a "
-             "`ckpt_*.pt` into `runs/<name>/`.")
+    st.title("AMT playground")
+    st.error("No checkpoints under `runs/`. Train something, or drop a `best.pt` "
+             "into `runs/<name>/`.")
     st.stop()
 
 with st.sidebar:
-    st.caption(describe_device())
-    ckpt_path = st.selectbox("checkpoint", ckpts,
-                             format_func=lambda p: os.path.join(
-                                 os.path.basename(os.path.dirname(p)),
-                                 os.path.basename(p)))
-    model, cfg, step, targs = load(ckpt_path, device)
+    ckpt_path = st.selectbox(
+        "checkpoint", ckpts,
+        format_func=lambda p: f"{os.path.basename(os.path.dirname(p))} · "
+                              f"{os.path.basename(p)}")
+    model, cfg, ck = load(ckpt_path, device)
     routers = routers_of(model)
 
-    st.markdown(
-        f"**{targs.get('variant', '?')}** · step {step:,} · "
-        f"{model.num_params()/1e6:.1f}M non-emb\n\n"
-        f"`{FlopModel(cfg).breakdown().total/1e6:.1f}` MFLOP/tok · "
-        f"depth_cap `{cfg.depth_capacity}` · mem_cap `{cfg.mem_capacity}`"
-    )
-
     st.divider()
-    n_tokens = st.slider("max new tokens", 16, 512, 200, 16)
+    n_samples = st.slider("samples", 1, 6, 3)
+    n_tokens = st.slider("tokens each", 16, 512, 160, 16)
     temperature = st.slider("temperature", 0.1, 1.5, 0.8, 0.05)
     top_k = st.slider("top-k", 1, 200, 50, 1)
-    seed = st.number_input("seed", value=1337, step=1)
+    seed = st.number_input("seed", value=1337, step=1,
+                           help="sample i uses seed + i")
 
     if routers:
         st.divider()
-        st.subheader("routing")
         stale = [r.name for r in routers if float(r.threshold) == 0.0]
         if stale:
-            st.warning(
-                f"{len(stale)} router(s) uncalibrated. Causal routing selects "
-                "every token until you calibrate, so this is a dense model with "
-                "extra steps.")
-        data_dir = st.text_input("data dir (for calibration)",
-                                 "data/fineweb_edu_docs")
+            st.warning(f"{len(stale)} router(s) uncalibrated — causal routing "
+                       "selects every token until you calibrate.")
+        data_dir = st.text_input("data dir", "data/fineweb_edu_docs",
+                                 help="held-out batches for router calibration")
         if st.button("calibrate routers", use_container_width=True):
             try:
                 loader = DocSegmentLoader(data_dir, 1, cfg.block_size,
                                           split="val", shuffle=False)
                 amp, _, _ = select_precision(device, verbose=False)
-                b = (model.make_bank(1, device, dtype=amp) if cfg.use_memory
-                     else None)
+                b = model.make_bank(1, device, dtype=amp) if cfg.use_memory else None
                 rates = model.calibrate_routers(
-                    [loader.next_batch()[0] for _ in range(3)], device=device,
-                    bank=b)
-                st.success(" · ".join(f"{k} {float(v):.3f}"
-                                      for k, v in rates.items()))
+                    [loader.next_batch()[0] for _ in range(3)], device=device, bank=b)
+                st.success(" · ".join(f"{k} {float(v):.3f}" for k, v in rates.items()))
             except Exception as exc:                      # noqa: BLE001
                 st.error(f"calibration failed: {exc}")
 
+# -- header ----------------------------------------------------------------
+
+st.title("AMT playground")
+
+targs = ck.get("args", {})
+val = ck.get("val_loss")
+chips = [
+    f'<span class="chip key">{targs.get("variant", "?")}</span>',
+    f'<span class="chip">step {ck.get("step", 0):,}</span>',
+    f'<span class="chip">{model.num_params()/1e6:.1f}M non-emb</span>',
+    f'<span class="chip">{FlopModel(cfg).breakdown().total/1e6:.1f} MFLOP/tok</span>',
+    f'<span class="chip">{device}</span>',
+]
+if val is not None:
+    import math
+    chips.insert(2, f'<span class="chip key">ppl {math.exp(min(val, 20)):.1f}</span>')
+if cfg.route_depth:
+    chips.append(f'<span class="chip">depth cap {cfg.depth_capacity}</span>')
+if cfg.use_memory:
+    chips.append(f'<span class="chip">mem cap {cfg.mem_capacity}</span>')
+st.markdown(f'<div class="chips">{"".join(chips)}</div>', unsafe_allow_html=True)
+
+# -- inputs ----------------------------------------------------------------
+
 context = ""
 if cfg.use_memory:
-    with st.expander("memory context — fills the bank before generating", expanded=False):
+    with st.expander("memory context — fills the bank before generating"):
         st.caption(
             "`AMT.generate` reads the memory bank but never writes to it. Without "
             "context here the bank stays empty, retrieval contributes nothing, and "
             "you are looking at a depth-routed model rather than the joint one.")
-        context = st.text_area("context passage", height=140,
-                               label_visibility="collapsed")
+        context = st.text_area("context", height=130, label_visibility="collapsed")
 
 prompt = st.text_area("prompt", "The most important idea in this paper is",
-                      height=90)
-go = st.button("generate", type="primary")
+                      height=80)
+go = st.button("generate", type="primary", use_container_width=True)
+
+# -- run -------------------------------------------------------------------
 
 if go:
     enc = tokenizer()
@@ -203,24 +252,55 @@ if go:
 
     if bank is not None and context.strip():
         n = warm_bank(model, bank, enc.encode(context), cfg.block_size, device)
-        st.caption(f"bank warmed with {n} tokens "
-                   f"(fill {float(bank.fill.float().mean()):.0f}/{bank.capacity})")
+        st.caption(f"bank warmed with {n} tokens · fill "
+                   f"{float(bank.fill.float().mean()):.0f}/{bank.capacity}")
     elif bank is not None:
         st.caption("bank empty — retrieval will contribute nothing")
 
     telemetry = {} if routers else None
+    bad_total = 0
+    progress = st.progress(0.0)
+
+    # Build every card up front so the layout does not jump as samples fill in.
+    slots = []
+    for i in range(n_samples):
+        with st.container(border=True):
+            st.markdown(f'<div class="sample-head">sample {i+1} · seed '
+                        f'{int(seed) + i}</div>', unsafe_allow_html=True)
+            slots.append(st.empty())
+    for slot in slots:
+        render(slot, prompt, "", done=True)
+
     with torch.no_grad():
-        st.write_stream(stream(model, enc, prompt, int(n_tokens), temperature,
-                               int(top_k), int(seed), bank, device, telemetry))
+        for i, slot in enumerate(slots):
+            body = ""
+            for delta, bad in stream(model, enc, prompt, int(n_tokens), temperature,
+                                     int(top_k), int(seed) + i, bank, device,
+                                     telemetry):
+                body += delta
+                render(slot, prompt, body)
+            render(slot, prompt, body, done=True)
+            bad_total += bad
+            progress.progress((i + 1) / n_samples)
+    progress.empty()
+
+    if bad_total:
+        st.caption(
+            f"{bad_total} sampled ids fell in the padded vocab "
+            f"({GPT2_VOCAB}–{cfg.vocab_size - 1}) and were dropped on decode. "
+            "Expected early in training; persistent means the head has mass on "
+            "tokens that never occur.")
 
     if telemetry:
         st.divider()
         st.caption("routing during generation — realised rate vs trained capacity")
-        cols = st.columns(min(len(telemetry), 4))
-        for i, (name, vals) in enumerate(sorted(telemetry.items())):
+        items = sorted(telemetry.items())
+        cols = st.columns(min(len(items), 4))
+        for i, (name, vals) in enumerate(items):
             target = cfg.mem_capacity if name == "mem_router" else cfg.depth_capacity
             got = sum(vals) / len(vals)
-            cols[i % len(cols)].metric(name, f"{got:.2f}", f"{got - target:+.2f}",
+            cols[i % len(cols)].metric(name.replace("depth_router_", "depth "),
+                                       f"{got:.2f}", f"{got - target:+.2f}",
                                        delta_color="off")
         st.caption(
             "A realised rate far from the trained capacity means the causal "

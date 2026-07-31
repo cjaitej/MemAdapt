@@ -142,6 +142,16 @@ def evaluate(model, loader, bank, device, device_type, steps=20, raw_model=None,
 # Main
 # ---------------------------------------------------------------------------
 
+def _toks(n):
+    """Token counts at a readable scale -- synthetic runs are thousands, real ones
+    hundreds of millions, and a fixed unit prints '0M' for one of them."""
+    if n >= 1e9:
+        return f"{n/1e9:,.2f}B"
+    if n >= 1e6:
+        return f"{n/1e6:,.1f}M"
+    return f"{n/1e3:,.1f}K"
+
+
 def prune_checkpoints(run_dir, keep):
     """Delete all but the `keep` most recent checkpoints in a run directory.
 
@@ -176,6 +186,12 @@ def main():
     ap.add_argument("--block-size", type=int, default=512)
     ap.add_argument("--total-batch-tokens", type=int, default=65536)
     ap.add_argument("--max-steps", type=int, default=19073)
+    ap.add_argument("--epochs", type=float, default=None,
+                    help="passes over the corpus, as an alternative to --max-steps; "
+                         "overrides it when given. Resolved to a step count before "
+                         "training starts rather than replacing it, because the LR "
+                         "cosine, capacity anneal, gate floor and entropy anneal all "
+                         "need a fixed horizon to schedule against")
     ap.add_argument("--warmup-steps", type=int, default=300)
     ap.add_argument("--max-lr", type=float, default=6e-4)
     ap.add_argument("--min-lr-frac", type=float, default=0.1)
@@ -237,6 +253,20 @@ def main():
     assert args.total_batch_tokens % (B * T) == 0, \
         "total-batch-tokens must be divisible by batch-size * block-size"
     grad_accum = args.total_batch_tokens // (B * T)
+
+    # Resolve --epochs into a step count here, before anything schedules against it.
+    # Written back onto args so config.json and the checkpoints record the number
+    # actually used -- a resume reads max_steps, not epochs, and the two must agree
+    # or the LR and capacity schedules would shift underneath the resumed run.
+    epoch_tokens = train_loader.tokens_per_epoch()
+    if args.epochs is not None:
+        args.max_steps = max(1, round(args.epochs * epoch_tokens
+                                      / args.total_batch_tokens))
+    planned = args.max_steps * args.total_batch_tokens
+    print(f"corpus      : {_toks(epoch_tokens)} trainable tokens/epoch at T={T}")
+    print(f"budget      : {args.max_steps:,} steps = {_toks(planned)} tokens "
+          f"= {planned/epoch_tokens:.2f} epochs"
+          + (f"  (from --epochs {args.epochs})" if args.epochs is not None else ""))
 
     # -- model ------------------------------------------------------------
     cfg = variant(args.variant, block_size=T)
@@ -379,11 +409,17 @@ def main():
             row = {"step": step, "split": "train", "loss": acc["lm"],
                    "aux": acc["aux"], "entropy": acc["entropy"], "lr": lr,
                    "grad_norm": float(norm), "depth_capacity": dc, "mem_capacity": mc,
-                   "dt_ms": dt * 1000, "tokens_per_sec": tps, **last_stats}
+                   "dt_ms": dt * 1000, "tokens_per_sec": tps,
+                   # Fractional position in the corpus. train_loader.epoch counts
+                   # completed wraps; the fraction within one comes from the token
+                   # budget, since streams advance at different rates per document.
+                   "epoch": (step + 1) * args.total_batch_tokens / epoch_tokens,
+                   **last_stats}
             with open(log_path, "a") as f:
                 f.write(json.dumps(row) + "\n")
             if step % max(args.log_every, 10) == 0:
-                print(f"step {step:5d} | loss {acc['lm']:.4f} | aux {acc['aux']:.3f} "
+                print(f"step {step:5d} | ep {row['epoch']:5.2f} "
+                      f"| loss {acc['lm']:.4f} | aux {acc['aux']:.3f} "
                       f"| lr {lr:.2e} | norm {float(norm):.2f} "
                       f"| cap {dc:.2f} | l/tok {last_stats.get('layers_per_token', 0):.2f} "
                       f"| {dt*1000:.0f}ms | {tps:,.0f} tok/s")
