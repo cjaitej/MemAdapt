@@ -9,6 +9,8 @@ Two silent-failure modes are pinned here:
 * `test_causal_mode_is_prefix_invariant` -- the top-k selection used in training peeks
   at the whole sequence. The causal path must not, or generation is running a
   different model than the one that was trained.
+* `test_entropy_bonus_survives_saturated_scores` -- the anti-saturation term must not
+  itself blow up on saturated scores, which is exactly when it is needed.
 """
 
 import pytest
@@ -240,3 +242,27 @@ def test_uncoupled_variant_has_no_conf_wire():
     for m in coupled.modules():
         if isinstance(m, AdaptiveBlock):
             assert m.router.w_route.in_features == cfg.n_embd + 1
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_entropy_bonus_survives_saturated_scores(dtype):
+    """Saturated scores are the case the entropy bonus exists to prevent.
+
+    bf16 cannot represent 1 - 1e-5 (it rounds to 1.0), so a clamp performed in the
+    score dtype leaves log(1 - p) = log(0) and the loss becomes NaN. A pretrained
+    backbone saturates these routers on the very first step, so this is not a
+    late-training corner case -- see amt/model/retrofit.py.
+    """
+    router = TopKTokenRouter(n_embd=8, capacity=0.5)
+    out = {"scores": torch.tensor([[1.0, 0.0, 0.5, 1.0]], dtype=dtype)}
+    bonus = router.entropy_bonus(out)
+    assert torch.isfinite(bonus), f"entropy bonus is {bonus} in {dtype}"
+    assert bonus >= 0.0
+
+
+def test_entropy_bonus_still_rewards_uncertainty():
+    """Guard the fix: the fp32 cast must not flatten the term into a constant."""
+    router = TopKTokenRouter(n_embd=8, capacity=0.5)
+    uncertain = router.entropy_bonus({"scores": torch.full((1, 4), 0.5)})
+    confident = router.entropy_bonus({"scores": torch.full((1, 4), 0.99)})
+    assert uncertain > confident

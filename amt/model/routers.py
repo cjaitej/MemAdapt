@@ -141,8 +141,17 @@ class TopKTokenRouter(nn.Module):
         scores saturating at 0/1 still kills the gradient that reaches the router
         through `weight`. Keeping some entropy early keeps that path alive; annealed
         to zero so the final routing decisions can be confident.
+
+        Computed in fp32, and that cast is load-bearing. Under bf16 autocast `scores`
+        is bf16, whose 8-bit mantissa cannot represent 1 - 1e-5: it rounds to exactly
+        1.0, the clamp meant to hold the log away from zero does nothing, (1 - p) is
+        0, and the whole loss becomes NaN. Saturated scores are the precise case this
+        term exists to prevent, so it has to stay finite through them -- and a
+        pretrained backbone (amt/model/retrofit.py) saturates these routers on the
+        first step, because the depth routers score the raw residual stream and a
+        trained one carries far larger activations than a freshly initialised one.
         """
-        p = out["scores"].clamp(1e-5, 1 - 1e-5)
+        p = out["scores"].float().clamp(1e-5, 1 - 1e-5)
         return -(p * p.log() + (1 - p) * (1 - p).log()).mean()
 
     @torch.no_grad()

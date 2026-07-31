@@ -25,6 +25,8 @@ from amt.data import DocSegmentLoader, make_random_shard
 from amt.model import AMT, FlopModel, TopKTokenRouter, variant
 from amt.model.amt import stats_to_floats, strip_compile_prefix
 from amt.model.blocks import MemoryBlock
+from amt.model.config import VARIANTS
+from amt.model.retrofit import (describe, freeze_backbone, from_gpt2, gpt2_config)
 from amt.precision import describe_device, make_scaler, select_precision
 
 
@@ -176,6 +178,17 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--variant", default="b6_amt_joint")
+    ap.add_argument("--init-from", default="scratch",
+                    help="'scratch', or a GPT-2 checkpoint (gpt2, gpt2-medium, "
+                         "gpt2-large, gpt2-xl) to retrofit. The pretrained backbone "
+                         "is frozen and only the routers and memory modules train, "
+                         "so 'base vs ours' compares identical weights")
+    ap.add_argument("--train-layernorms", action="store_true",
+                    help="retrofit only: also train the LayerNorms. Reach for this "
+                         "if the routers cannot learn on frozen features -- and "
+                         "report that you did")
+    ap.add_argument("--train-memory-block", action="store_true",
+                    help="retrofit only: also train the memory layer's attn/MLP")
     ap.add_argument("--data-dir", default="data/fineweb_edu_docs")
     ap.add_argument("--synthetic", action="store_true",
                     help="train on generated random shards; for plumbing checks only")
@@ -269,8 +282,26 @@ def main():
           + (f"  (from --epochs {args.epochs})" if args.epochs is not None else ""))
 
     # -- model ------------------------------------------------------------
-    cfg = variant(args.variant, block_size=T)
-    model = AMT(cfg).to(device)
+    # Two ways in, one variant table. `--init-from gpt2` applies the same routing
+    # flags to a pretrained backbone instead of a fresh one, so every baseline in
+    # RESEARCH_PLAN.md §7.1 has a retrofit twin under the same name.
+    if args.init_from == "scratch":
+        cfg = variant(args.variant, block_size=T)
+        model = AMT(cfg).to(device)
+    else:
+        if args.variant not in VARIANTS:
+            raise KeyError(f"unknown variant {args.variant!r}; "
+                           f"known: {sorted(VARIANTS)}")
+        cfg = gpt2_config(args.init_from, block_size=T, **VARIANTS[args.variant])
+        model, report = from_gpt2(args.init_from, cfg, device=device)
+        stats = freeze_backbone(model, train_layernorms=args.train_layernorms,
+                                train_memory_block=args.train_memory_block)
+        print(describe(report, stats))
+        if stats["trainable"] == 0:
+            raise SystemExit(
+                f"--variant {args.variant} adds no modules to {args.init_from}, so a "
+                "retrofit run would train nothing. That arm is the frozen base model: "
+                "evaluate it with scripts/infer.py instead of training it.")
     fm = FlopModel(cfg)
 
     print(f"\nvariant     : {args.variant}")
