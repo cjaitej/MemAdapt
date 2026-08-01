@@ -60,7 +60,16 @@ def resolve_ckpt(path, prefer_best=True):
         return best
     ckpts = sorted(glob.glob(os.path.join(path, "ckpt_*.pt")))
     if not ckpts:
-        raise FileNotFoundError(f"no best.pt or ckpt_*.pt in {path}")
+        # Say what IS there. A run directory with no checkpoint usually means the
+        # run died early, or that this is a fresh session and the checkpoints live
+        # somewhere the working directory was not carried over from.
+        siblings = sorted(
+            os.path.dirname(p) for p in
+            glob.glob(os.path.join(os.path.dirname(path) or ".", "*", "*.pt")))
+        detail = ("\nRun directories that do have checkpoints:\n"
+                  + "\n".join(f"  {s}" for s in dict.fromkeys(siblings))
+                  if siblings else "")
+        raise FileNotFoundError(f"no best.pt or ckpt_*.pt in {path}{detail}")
     return ckpts[-1]
 
 

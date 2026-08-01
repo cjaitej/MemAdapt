@@ -266,3 +266,77 @@ def test_entropy_bonus_still_rewards_uncertainty():
     uncertain = router.entropy_bonus({"scores": torch.full((1, 4), 0.5)})
     confident = router.entropy_bonus({"scores": torch.full((1, 4), 0.99)})
     assert uncertain > confident
+
+
+# --------------------------------------------------------------------------
+# route_attention=False: route the contribution, keep the context
+# --------------------------------------------------------------------------
+
+def test_dense_attention_mode_still_trains_the_router():
+    """The router must stay on the backward path when attention is not routed."""
+    cfg = tiny_config(route_attention=False)
+    block = AdaptiveBlock(cfg, layer_idx=2)
+    x = torch.randn(2, 32, cfg.n_embd)
+    out, _ = block(x, conf=torch.randn(2, 32))
+    out.sum().backward()
+    g = block.router.w_route.weight.grad
+    assert g is not None and g.abs().sum() > 0
+
+
+def test_dense_attention_leaves_dropped_tokens_untouched():
+    """A token the router rejects must come out of the block exactly as it went in."""
+    torch.manual_seed(0)
+    cfg = tiny_config(route_attention=False, depth_capacity=0.5)
+    block = AdaptiveBlock(cfg, layer_idx=2).eval()
+    x = torch.randn(1, 32, cfg.n_embd)
+    with torch.no_grad():
+        y, out = block(x, conf=torch.zeros(1, 32))
+    dropped = ~out["mask"][0]
+    assert dropped.any(), "fixture must drop something"
+    assert torch.allclose(y[0][dropped], x[0][dropped], atol=1e-6)
+
+
+def test_dense_attention_sees_the_whole_context():
+    """The distinguishing property: a dropped token still shapes what others read.
+
+    Under the gather path a rejected token vanishes from the block's attention, so
+    perturbing it cannot move any other token's output. Keeping attention dense is
+    precisely the choice to let it -- which is what a pretrained backbone needs,
+    since it learned its attention over the full context.
+
+    The routing is hand-made rather than taken from the router: perturbing a token
+    also changes its own score, which can flip the top-k membership, and a selection
+    change would move the outputs for reasons that have nothing to do with attention.
+    """
+    from amt.model.routers import gather_tokens, scatter_add_tokens
+
+    torch.manual_seed(0)
+    cfg = tiny_config(depth_capacity=0.5)
+    block = AdaptiveBlock(cfg, layer_idx=2).eval()
+    T, keep_at, drop_at, look_at = 32, 0, 1, 2      # keep evens, drop odds
+
+    mask = torch.zeros(1, T, dtype=torch.bool)
+    mask[0, ::2] = True
+    idx = mask[0].nonzero().flatten().unsqueeze(0)
+    scores = torch.full((1, T), 0.9)
+    assert mask[0, look_at] and not mask[0, drop_at]
+
+    x = torch.randn(1, T, cfg.n_embd)
+    x2 = x.clone()
+    x2[0, drop_at] += 5.0
+
+    def gather_path(inp):
+        xs = gather_tokens(inp, idx)
+        delta = block.block.delta(xs) * scores.gather(1, idx).unsqueeze(-1)
+        return scatter_add_tokens(inp, idx, delta)
+
+    def dense_path(inp):
+        return block._dense_attention_forward(
+            inp, {"mask": mask, "scores": scores})
+
+    with torch.no_grad():
+        gathered = (gather_path(x2) - gather_path(x))[0, look_at].abs().max()
+        dense = (dense_path(x2) - dense_path(x))[0, look_at].abs().max()
+
+    assert gathered == 0, "gather path should not see the dropped token"
+    assert dense > 0, "dense-attention path must still attend to it"

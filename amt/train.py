@@ -234,6 +234,11 @@ def main():
                          "works from scratch is far too aggressive for it")
     ap.add_argument("--mem-capacity", type=float, default=None,
                     help="override the variant's memory capacity")
+    ap.add_argument("--dense-attention", action="store_true",
+                    help="route each adaptive block's contribution but NOT its "
+                         "attention, so every token still attends to the full "
+                         "context. Saves less per layer; on a pretrained backbone it "
+                         "is worth far more than it costs (AMTConfig.route_attention)")
     ap.add_argument("--capacity-warmup-frac", type=float, default=0.1,
                     help="fraction of steps run dense before routing tightens")
     ap.add_argument("--capacity-anneal-frac", type=float, default=0.4,
@@ -294,6 +299,8 @@ def main():
     # RESEARCH_PLAN.md §7.1 has a retrofit twin under the same name.
     caps = {k: v for k, v in (("depth_capacity", args.depth_capacity),
                               ("mem_capacity", args.mem_capacity)) if v is not None}
+    if args.dense_attention:
+        caps["route_attention"] = False
     if args.init_from == "scratch":
         cfg = variant(args.variant, block_size=T, **caps)
         model = AMT(cfg).to(device)

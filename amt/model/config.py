@@ -43,6 +43,23 @@ class AMTConfig:
     # to route down from there, rather than starting damaged.
     route_bias_init: float = 0.0
 
+    # Does routing a token out also remove it from the block's ATTENTION, or only
+    # from the block's contribution?
+    #
+    # True (Mixture-of-Depths semantics, the default) gathers the selected tokens and
+    # runs the whole block on that subset, so a selected token attends only to other
+    # selected tokens. Cheapest, and correct when the model is trained this way from
+    # scratch -- it learns to read a subsampled context.
+    #
+    # False computes attention over the full sequence and applies the block's delta
+    # only to the selected tokens. It saves the projections and the MLP but not the
+    # attention, so the saving per adaptive layer drops from (1-c) of 24d^2+4d*ctx to
+    # (1-c) of 18d^2. Measured on frozen GPT-2 with untrained routers, that buys a
+    # lot: at capacity 0.5, 88.6 ppl -> 57.3, and at 0.9, 36.6 -> 30.3 against a base
+    # of 27.6. A pretrained backbone has never seen a subsampled context and does not
+    # survive one; a from-scratch model has seen nothing else.
+    route_attention: bool = True
+
     # ---- memory ----------------------------------------------------------
     mem_size: int = 2048          # M: FIFO bank entries per batch element
     n_neighbors: int = 32         # k in kNN

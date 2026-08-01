@@ -143,6 +143,16 @@ def main():
     if passthrough and passthrough[0] == "--":
         passthrough = passthrough[1:]
 
+    # Resolve the corpus once, here. Every child would otherwise rediscover a bad
+    # --data-dir two seconds in and print the same traceback N times, after the
+    # session has already been spent starting up.
+    if not args.dry_run:
+        from amt.data.loaders import resolve_data_dir
+        try:
+            args.data_dir = resolve_data_dir(args.data_dir)
+        except FileNotFoundError as exc:
+            sys.exit(f"\n{exc}\n")
+
     gpus = args.gpus if args.gpus is not None else list(range(max(gpu_count(), 1)))
     names = args.run_names or [f"{args.prefix}_{v}" for v in args.variants]
     if len(names) != len(args.variants):

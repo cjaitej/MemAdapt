@@ -256,6 +256,9 @@ class AdaptiveBlock(nn.Module):
         cond = conf.unsqueeze(-1).to(x.dtype) if self.config.couple else None
         out = self.router(x, cond=cond, causal=causal)
 
+        if not self.config.route_attention:
+            return self._dense_attention_forward(x, out), out
+
         if out["idx"] is None:
             return self._masked_forward(x, out), out
 
@@ -266,6 +269,23 @@ class AdaptiveBlock(nn.Module):
         # Drop this and the router gets no gradient and never leaves its init.
         delta = delta * weight.unsqueeze(-1).to(delta.dtype)
         return scatter_add_tokens(x, idx, delta), out
+
+    def _dense_attention_forward(self, x, out):
+        """Route the block's contribution, not its attention (route_attention=False).
+
+        The block runs over the whole sequence -- so every token still attends to
+        every earlier token, exactly as the pretrained model expects -- and the delta
+        is added back only where the router selected. Identical in both modes: `mask`
+        is the top-k membership under teacher forcing and the thresholded causal
+        prediction during generation, so the same expression serves both and there is
+        no train/generate asymmetry to reconcile here.
+
+        The router still receives gradient through `scores`, which is what keeps this
+        trainable at all (see TopKTokenRouter.forward).
+        """
+        delta = self.block.delta(x)
+        keep = out["mask"].to(delta.dtype) * out["scores"].to(delta.dtype)
+        return x + delta * keep.unsqueeze(-1)
 
     def _masked_forward(self, x, out):
         """Causal-mode path: same semantics as the gather/scatter path, no speedup.

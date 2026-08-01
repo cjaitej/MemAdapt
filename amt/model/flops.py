@@ -172,6 +172,26 @@ class FlopModel:
         """Total forward FLOPs per token for one dense transformer layer."""
         return self.layer_matmul() + self.layer_attention(ctx_len)
 
+    def adaptive_layer(self, capacity: float) -> float:
+        """Forward FLOPs per token for one adaptive layer at a given capacity.
+
+        With `route_attention` (the default) a dropped token skips the entire block,
+        so the layer costs `capacity` times a dense one.
+
+        With `route_attention=False` the block still attends over every token and
+        only its *contribution* is routed, so qkv and the attention itself are paid
+        for in full and only the output projection (2d^2) and the MLP (16d^2) scale
+        with capacity. That is a strictly worse FLOP deal at equal capacity, bought
+        deliberately: on a pretrained backbone it is worth far more in quality than
+        it costs in FLOPs (see AMTConfig.route_attention).
+        """
+        d = self.c.n_embd
+        if self.c.route_attention:
+            return capacity * self.layer()
+        dense = 6.0 * d * d + self.layer_attention()      # qkv + attention
+        routed = 18.0 * d * d                             # out-proj + mlp
+        return dense + capacity * routed
+
     def retrieval(self) -> float:
         """MATMUL FLOPs per *retrieving* token: kNN scan + attend over neighbours.
 
@@ -287,7 +307,7 @@ class FlopModel:
             trunk=c.n_trunk * per_layer,
             memory_layer=per_layer,
             retrieval=mc * self.retrieval() if c.use_memory else 0.0,
-            adaptive=n_adaptive * dc * per_layer,
+            adaptive=n_adaptive * self.adaptive_layer(dc),
             tail=n_dense_other * per_layer,
             routing=self.routing(),
             head=self.head(),

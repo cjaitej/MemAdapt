@@ -18,6 +18,60 @@ import numpy as np
 import torch
 
 
+def find_shard_dirs(roots=("data", "/kaggle/input", "/kaggle/working"), max_depth=7):
+    """Directories that actually contain `*_tokens.npy`, searched a few levels deep.
+
+    Kaggle mounts a dataset at a path built from the dataset's slug and its internal
+    folder layout, which almost never matches what you typed from memory. The result
+    is a run that dies two seconds in, after the session has already been started.
+    """
+    found = []
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        root_depth = root.rstrip(os.sep).count(os.sep)
+        for dirpath, dirnames, filenames in os.walk(root):
+            if dirpath.count(os.sep) - root_depth >= max_depth:
+                dirnames[:] = []
+                continue
+            if any(f.endswith("_tokens.npy") for f in filenames):
+                found.append(dirpath)
+                dirnames[:] = []          # do not descend into a shard directory
+    return sorted(set(found))
+
+
+def resolve_data_dir(data_dir):
+    """Return a directory holding token shards, or raise saying where to look.
+
+    A wrong `--data-dir` used to surface as `FileNotFoundError` from `os.listdir`
+    inside the loader -- accurate, and useless, because it neither says what was
+    expected nor what is available. When exactly one usable directory exists, this
+    takes it and says so loudly; when several do, it refuses and lists them rather
+    than guessing which corpus an experiment was supposed to use.
+
+    Only a directory that does not EXIST is redirected. One that exists but holds no
+    shards is a different failure -- prep that did not finish, or the wrong split --
+    and substituting some other corpus there would quietly change what an experiment
+    trained on. That case is left to the caller's own check.
+    """
+    if os.path.isdir(data_dir):
+        return data_dir
+
+    candidates = find_shard_dirs()
+    if len(candidates) == 1:
+        print(f"data dir    : {data_dir!r} not found; using the only shard directory "
+              f"on this machine:\n              {candidates[0]}", flush=True)
+        return candidates[0]
+
+    detail = ("\n".join(f"  {c}" for c in candidates) if candidates
+              else "  (none found under data/, /kaggle/input, /kaggle/working)")
+    raise FileNotFoundError(
+        f"no token shards in {data_dir!r}.\n"
+        f"Directories that do contain *_tokens.npy:\n{detail}\n"
+        "Pass one of those as --data-dir, or run `python -m amt.data.prepare`."
+    )
+
+
 class DocSegmentLoader:
     """Yields consecutive segments of long documents, one stream per batch row.
 
@@ -33,6 +87,7 @@ class DocSegmentLoader:
 
     def __init__(self, data_dir, B, T, split="train", process_rank=0,
                  num_processes=1, shuffle=True, seed=1337):
+        data_dir = resolve_data_dir(data_dir)
         self.data_dir = data_dir
         self.B, self.T = B, T
         self.split = split
