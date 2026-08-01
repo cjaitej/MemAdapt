@@ -18,6 +18,11 @@ class AdaptiveGPTConfig:
     n_head: int = 6
     n_embd: int = 384
     bias: bool = True          # bias in Linears/LayerNorms (GPT-2 uses True)
+    # Residual and attention dropout. 0.0 is right for a single pass over a large
+    # corpus, which is the regime nanoGPT targets. It is NOT right here: WikiText-103
+    # is ~117M tokens and a 40M-parameter model needs several passes over it to train,
+    # so the run is multi-epoch by construction and will memorise without this. Try
+    # 0.1 for a 2-epoch budget and raise it if the train/val gap opens up.
     dropout: float = 0.0
 
     # ---- early exit -------------------------------------------------------

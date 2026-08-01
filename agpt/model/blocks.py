@@ -28,6 +28,19 @@ class CausalSelfAttention(nn.Module):
         self.c_proj.NANOGPT_SCALE_INIT = 1
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        self.resid_drop = nn.Dropout(config.dropout)
+
+    def attn_dropout(self):
+        """Dropout probability to hand to SDPA -- zero outside training.
+
+        `scaled_dot_product_attention` takes a probability, not a module, so it does
+        not consult `self.training` on its own. Passing the configured value
+        unconditionally would apply dropout during evaluation, which shows up as a
+        validation loss that is worse than the training loss and moves between runs
+        for no visible reason.
+        """
+        return self.dropout if self.training else 0.0
 
     def _split_heads(self, t):
         B, T, C = t.size()
@@ -65,8 +78,9 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x):
         q, k, v = self.qkv(x)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        return self.c_proj(self.merge_heads(y))
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True,
+                                           dropout_p=self.attn_dropout())
+        return self.resid_drop(self.c_proj(self.merge_heads(y)))
 
 
 class MLP(nn.Module):
@@ -77,9 +91,10 @@ class MLP(nn.Module):
         self.gelu = nn.GELU(approximate="tanh")
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.c_proj.NANOGPT_SCALE_INIT = 1
+        self.drop = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        return self.c_proj(self.gelu(self.c_fc(x)))
+        return self.drop(self.c_proj(self.gelu(self.c_fc(x))))
 
 
 class Block(nn.Module):
@@ -155,8 +170,9 @@ class Block(nn.Module):
             pos_k = torch.arange(T, device=idx.device).view(1, 1, T)
             mask = pos_k <= pos_q                                # (B, k, T)
 
-        y = F.scaled_dot_product_attention(q, kk, vv, attn_mask=mask.unsqueeze(1))
-        y = self.attn.c_proj(self.attn.merge_heads(y))           # (B, k, C)
+        y = F.scaled_dot_product_attention(q, kk, vv, attn_mask=mask.unsqueeze(1),
+                                           dropout_p=self.attn.attn_dropout())
+        y = self.attn.resid_drop(self.attn.c_proj(self.attn.merge_heads(y)))
 
         x_sel = gather_tokens(x_full, idx)
         h = x_sel + y

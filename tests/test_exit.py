@@ -239,3 +239,41 @@ def test_exited_tokens_do_not_update_the_backbone(tokens):
     assert grads, "no gradients recorded at all"
     assert all(g.abs().sum() == 0 for g in grads), \
         "the last block got gradient from tokens that never entered it"
+
+
+# ---------------------------------------------------------------------------
+# Dropout
+# ---------------------------------------------------------------------------
+
+def test_dropout_is_active_in_train_and_off_in_eval(tokens):
+    """A config field that nothing reads is worse than no field at all.
+
+    `dropout` sat in the config unused for the whole of the previous design, so a run
+    launched with `--dropout 0.1` would have trained with none and the config.json
+    would have said otherwise. This pins that it reaches the model, and that it is off
+    at eval -- attention dropout goes to SDPA as a probability rather than a module,
+    so it does not consult `self.training` unless something makes it.
+    """
+    model, _ = build("adaptive", dropout=0.5)
+
+    model.eval()
+    with torch.no_grad():
+        a, _, _ = model(tokens, return_logits=True)
+        b, _, _ = model(tokens, return_logits=True)
+    assert torch.equal(a, b), "eval-mode forward was not deterministic"
+
+    model.train()
+    torch.manual_seed(0)
+    c, _, _ = model(tokens, return_logits=True)
+    torch.manual_seed(1)
+    d, _, _ = model(tokens, return_logits=True)
+    assert not torch.allclose(c, d), "train-mode forward showed no dropout"
+
+
+def test_zero_dropout_changes_nothing(tokens):
+    model, _ = build("adaptive", dropout=0.0)
+    model.train()
+    with torch.no_grad():
+        a, _, _ = model(tokens, return_logits=True)
+        b, _, _ = model(tokens, return_logits=True)
+    assert torch.equal(a, b)

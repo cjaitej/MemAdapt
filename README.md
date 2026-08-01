@@ -95,15 +95,17 @@ pytest -q                                     # 74 tests, ~15s on CPU
 python -m agpt.data.prepare --dataset wikitext103        # ~117M GPT-2 tokens
 
 # Stage 1 — the language model, dense. This checkpoint is ALSO the dense baseline.
-python -m agpt.train --stage dense --run-name s1_dense --max-steps 12000 --compile
+python -m agpt.train --stage dense --run-name s1_dense \
+    --max-steps 3600 --dropout 0.1 --eval-steps 40 --compile
 
 # Stage 2 — freeze it, fit the routers against derived convergence labels
 python -m agpt.train --stage routers --init-from runs/s1_dense/best.pt \
-    --run-name s2_routers --max-steps 1500 --compile
+    --run-name s2_routers --max-steps 1500 --dropout 0.1 --eval-steps 40 --compile
 
 # Stage 3 — unfreeze, let the model adapt to being interrupted
 python -m agpt.train --stage joint --init-from runs/s2_routers/best.pt \
-    --run-name s3_joint --max-steps 3000 --lambda-depth 0.05 --compile
+    --run-name s3_joint --max-steps 3000 --lambda-depth 0.05 \
+    --dropout 0.1 --eval-steps 40 --compile
 
 python scripts/compare.py   --ckpt runs/s3_joint/best.pt      # the four-arm table
 python scripts/benchmark.py --ckpt runs/s3_joint/best.pt --compile
@@ -113,6 +115,15 @@ python scripts/figures.py                                     # figures/*.png + 
 python scripts/infer.py --ckpt runs/s3_joint/best.pt --show-depth
 streamlit run scripts/app.py
 ```
+
+**Two numbers that set those flags.** WikiText-103 is 117,690,368 training tokens, so
+one epoch is **1,795 steps** at the default 65536 tokens/step — `--max-steps 3600` is
+two epochs. And the val split holds only 245,760 usable tokens, which is exactly **60
+batches** at B=8/T=512, so `--eval-steps` above 60 just re-measures the same data.
+
+Training is multi-epoch by construction at this corpus size, which is why `--dropout
+0.1` appears above; the nanoGPT default of 0.0 assumes a single pass over something
+much larger.
 
 Plumbing check with no corpus at all:
 

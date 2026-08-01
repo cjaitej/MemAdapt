@@ -288,6 +288,10 @@ def build_parser():
     ap.add_argument("--fixed-exit-layer", type=int, default=None)
     ap.add_argument("--random-continue-p", type=float, default=None)
     ap.add_argument("--exited-as-keys", choices=["stale", "drop"], default=None)
+    ap.add_argument("--dropout", type=float, default=None,
+                    help="residual + attention dropout. 0.0 suits a single pass over "
+                         "a huge corpus; WikiText-103 is small enough that training "
+                         "is multi-epoch by construction, so use ~0.1")
     ap.add_argument("--soft-gate", action="store_true",
                     help="use the soft cumulative probability instead of the "
                          "straight-through hard gate. Trains more smoothly and "
@@ -310,7 +314,8 @@ def build_parser():
 
 def config_overrides(args):
     """CLI routing flags -> AdaptiveGPTConfig kwargs, omitting anything unset."""
-    named = dict(n_min_layers=args.n_min_layers, target_type=args.target_type,
+    named = dict(dropout=args.dropout,
+                 n_min_layers=args.n_min_layers, target_type=args.target_type,
                  target_tau=args.target_tau, lambda_router=args.lambda_router,
                  lambda_depth=args.lambda_depth,
                  fixed_exit_layer=args.fixed_exit_layer,
