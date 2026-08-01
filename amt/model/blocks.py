@@ -245,6 +245,11 @@ class AdaptiveBlock(nn.Module):
             cond_dim=cond_dim,
             random_route=config.random_route,
             name=f"depth_router_{layer_idx}",
+            # Only the depth routers take this. The memory router's `weight` never
+            # scales anything -- MemoryBlock uses its idx/mask and a separate learned
+            # gate -- so saturating its scores would cost discrimination in the
+            # selection and buy nothing back.
+            bias_init=config.route_bias_init,
         )
 
     def forward(self, x, conf=None, causal=False):

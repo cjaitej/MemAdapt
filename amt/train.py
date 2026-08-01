@@ -227,6 +227,13 @@ def main():
     ap.add_argument("--resume", default=None,
                     help="path to a checkpoint, or 'latest' to pick the newest in the "
                          "run dir; needed on Kaggle/Colab where sessions are capped")
+    ap.add_argument("--depth-capacity", type=float, default=None,
+                    help="override the variant's depth capacity. The retrofit needs "
+                         "this: a frozen backbone was trained dense and cannot "
+                         "recover from having layers removed, so the capacity that "
+                         "works from scratch is far too aggressive for it")
+    ap.add_argument("--mem-capacity", type=float, default=None,
+                    help="override the variant's memory capacity")
     ap.add_argument("--capacity-warmup-frac", type=float, default=0.1,
                     help="fraction of steps run dense before routing tightens")
     ap.add_argument("--capacity-anneal-frac", type=float, default=0.4,
@@ -285,14 +292,17 @@ def main():
     # Two ways in, one variant table. `--init-from gpt2` applies the same routing
     # flags to a pretrained backbone instead of a fresh one, so every baseline in
     # RESEARCH_PLAN.md §7.1 has a retrofit twin under the same name.
+    caps = {k: v for k, v in (("depth_capacity", args.depth_capacity),
+                              ("mem_capacity", args.mem_capacity)) if v is not None}
     if args.init_from == "scratch":
-        cfg = variant(args.variant, block_size=T)
+        cfg = variant(args.variant, block_size=T, **caps)
         model = AMT(cfg).to(device)
     else:
         if args.variant not in VARIANTS:
             raise KeyError(f"unknown variant {args.variant!r}; "
                            f"known: {sorted(VARIANTS)}")
-        cfg = gpt2_config(args.init_from, block_size=T, **VARIANTS[args.variant])
+        cfg = gpt2_config(args.init_from, block_size=T,
+                          **{**VARIANTS[args.variant], **caps})
         model, report = from_gpt2(args.init_from, cfg, device=device)
         stats = freeze_backbone(model, train_layernorms=args.train_layernorms,
                                 train_memory_block=args.train_memory_block)

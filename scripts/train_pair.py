@@ -78,6 +78,11 @@ def child_env(gpu, run_dir):
     env["CUDA_VISIBLE_DEVICES"] = str(gpu)
     # Belt and braces with `-u`: this also reaches anything the child spawns.
     env["PYTHONUNBUFFERED"] = "1"
+    # Progress bars are for terminals. These children write to a pipe, where every
+    # redraw is a separate line -- and the hub's bars are drawn before any of our
+    # code runs, so an env var is the only thing early enough to stop them.
+    env.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    env.setdefault("TQDM_DISABLE", "1")
     # Separate inductor caches. Two processes compiling the same graph at the same
     # moment otherwise race on one cache directory, and the failure mode is a
     # corrupted entry that only shows up as a compile error on a later run.

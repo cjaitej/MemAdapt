@@ -78,7 +78,13 @@ def gpt2_config(model_type="gpt2", **overrides) -> AMTConfig:
     if model_type not in GPT2_SHAPES:
         raise KeyError(f"unknown {model_type!r}; known: {sorted(GPT2_SHAPES)}")
     kw = dict(GPT2_SHAPES[model_type])
-    kw.update(vocab_size=50257, block_size=1024, bias=True)
+    # route_bias_init=4.0 -> sigmoid(4) = 0.982, so at capacity 1.0 the retrofit IS
+    # the pretrained model and every measurement starts from the base rather than
+    # from a halved one. Measured: at cap 1.0 the default 0.0 scores 51.3 ppl against
+    # the base's 27.9, and 4.0 restores it to 28.5. Raise it for a closer identity at
+    # the cost of router gradient (sigmoid saturates); lower it to keep the router
+    # more plastic at the cost of starting further from the base.
+    kw.update(vocab_size=50257, block_size=1024, bias=True, route_bias_init=4.0)
     kw.update(overrides)
     return AMTConfig(**kw)
 
@@ -166,9 +172,17 @@ def from_gpt2(model_type="gpt2", config=None, device="cpu"):
     """Build an AMT at GPT-2's shape and fill it with the pretrained weights."""
     try:
         from transformers import GPT2LMHeadModel
+        from transformers.utils import logging as hf_logging
     except ImportError as e:                              # noqa: BLE001
         raise SystemExit("the 'transformers' package is required for the retrofit:\n"
                          "    pip install transformers") from e
+
+    # Silence the per-tensor "Materializing param=..." bar. It redraws once per
+    # parameter -- ~150 times per model -- and a progress bar is only a progress bar
+    # on a terminal. Piped into a log (scripts/train_pair.py merges stderr and runs
+    # unbuffered) every redraw becomes its own line, burying the training output it
+    # is printed next to.
+    hf_logging.disable_progress_bar()
 
     cfg = config or gpt2_config(model_type)
     expected = GPT2_SHAPES[model_type]

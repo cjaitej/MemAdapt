@@ -34,6 +34,14 @@ class AMTConfig:
 
     depth_capacity: float = 0.5   # c_l: fraction of tokens through each adaptive layer
     mem_capacity: float = 0.25    # fraction of tokens that query the memory bank
+    # Bias init for the depth routers' scoring head. 0.0 gives sigmoid(0) = 0.5, so
+    # every adaptive block contributes HALF its delta at initialisation. Training from
+    # scratch absorbs that -- the weights grow into it. A pretrained backbone cannot:
+    # halving seven of twelve residual contributions costs GPT-2 27.9 -> 51.3 ppl
+    # before a single token is routed away. Retrofits set this high (see
+    # retrofit.gpt2_config) so the model starts as the pretrained function and learns
+    # to route down from there, rather than starting damaged.
+    route_bias_init: float = 0.0
 
     # ---- memory ----------------------------------------------------------
     mem_size: int = 2048          # M: FIFO bank entries per batch element

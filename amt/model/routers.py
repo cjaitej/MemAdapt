@@ -42,13 +42,19 @@ class TopKTokenRouter(nn.Module):
         show the learned router is doing more than hitting a FLOP target
     """
 
-    def __init__(self, n_embd, capacity, cond_dim=0, random_route=False, name="router"):
+    def __init__(self, n_embd, capacity, cond_dim=0, random_route=False, name="router",
+                 bias_init=0.0):
         super().__init__()
         self.n_embd = n_embd
         self.capacity = capacity
         self.cond_dim = cond_dim
         self.random_route = random_route
         self.name = name
+        # Where the scoring head starts. The caller multiplies the block delta by
+        # `weight`, so this sets how much of the block survives at step 0: sigmoid(0)
+        # = 0.5 halves it, sigmoid(4) = 0.98 leaves it essentially intact. See
+        # AMTConfig.route_bias_init for why a retrofit needs the latter.
+        self.bias_init = bias_init
 
         self.w_route = nn.Linear(n_embd + cond_dim, 1, bias=True)
         # Auxiliary causal predictor. Trained on detached features so it can never
@@ -64,8 +70,9 @@ class TopKTokenRouter(nn.Module):
         for lin in (self.w_route, self.w_aux):
             nn.init.normal_(lin.weight, mean=0.0, std=0.02)
             nn.init.zeros_(lin.bias)
-        # Start the aux head near the target rate so early BCE gradients are sane.
         with torch.no_grad():
+            self.w_route.bias.fill_(self.bias_init)
+            # Start the aux head near the target rate so early BCE gradients are sane.
             p = min(max(self.capacity, 1e-3), 1 - 1e-3)
             self.w_aux.bias.fill_(math.log(p / (1 - p)))
 

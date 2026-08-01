@@ -29,29 +29,33 @@ def fake_hf_state(cfg, vocab=None, positions=None):
     d = cfg.n_embd
     sd, seed = {}, [0]
 
-    def t(*shape):
+    # Scaled like a real checkpoint (std 0.02, LayerNorm gains near 1) rather than
+    # unit normal. Unscaled weights make activations blow up through the stack, which
+    # saturates the router's sigmoid at random and makes any test of what the router
+    # multiplier does to the output meaningless.
+    def t(*shape, scale=0.02):
         seed[0] += 1
         g = torch.Generator().manual_seed(seed[0])
-        return torch.randn(*shape, generator=g)
+        return torch.randn(*shape, generator=g) * scale
 
     sd["transformer.wte.weight"] = t(vocab, d)
     sd["transformer.wpe.weight"] = t(positions, d)
     for i in range(cfg.n_layer):
         p = f"transformer.h.{i}."
-        sd[p + "ln_1.weight"] = t(d)
+        sd[p + "ln_1.weight"] = 1.0 + t(d)
         sd[p + "ln_1.bias"] = t(d)
         sd[p + "attn.c_attn.weight"] = t(d, 3 * d)      # Conv1D: (in, out)
         sd[p + "attn.c_attn.bias"] = t(3 * d)
         sd[p + "attn.c_proj.weight"] = t(d, d)
         sd[p + "attn.c_proj.bias"] = t(d)
-        sd[p + "ln_2.weight"] = t(d)
+        sd[p + "ln_2.weight"] = 1.0 + t(d)
         sd[p + "ln_2.bias"] = t(d)
         sd[p + "mlp.c_fc.weight"] = t(d, 4 * d)
         sd[p + "mlp.c_fc.bias"] = t(4 * d)
         sd[p + "mlp.c_proj.weight"] = t(4 * d, d)
         sd[p + "mlp.c_proj.bias"] = t(d)
         sd[p + "attn.bias"] = torch.ones(1, 1, positions, positions)   # buffer
-    sd["transformer.ln_f.weight"] = t(d)
+    sd["transformer.ln_f.weight"] = 1.0 + t(d)
     sd["transformer.ln_f.bias"] = t(d)
     sd["lm_head.weight"] = sd["transformer.wte.weight"]                # tied
     return sd
@@ -216,3 +220,47 @@ def test_from_gpt2_real():
     assert report["unmatched_source"] == []
     assert report["n_new"] == 21_559, report["n_new"]
     assert all(is_new_module(n) for n in report["new"])
+
+
+def _routed_vs_dense(bias_init):
+    """Max |logit| difference between a capacity-1.0 routed model and a dense one
+    built from identical weights."""
+    shared = dict(n_layer=6, n_head=2, n_embd=32, block_size=16, vocab_size=64,
+                  n_trunk=2, n_dense_tail=1, use_memory=False)
+    sd = fake_hf_state(AMTConfig(**shared))
+
+    dense = AMT(AMTConfig(**shared, route_depth=False))
+    routed = AMT(AMTConfig(**shared, route_depth=True, depth_capacity=1.0,
+                           route_bias_init=bias_init))
+    load_gpt2_state_dict(dense, sd)
+    load_gpt2_state_dict(routed, sd)
+    assert routed.config.adaptive_layers, "fixture must have adaptive layers"
+
+    x = torch.randint(0, 64, (2, 16))
+    with torch.no_grad():
+        a = dense(x, return_logits=True)[0]
+        b = routed(x, return_logits=True)[0]
+    return (a - b).abs().max().item()
+
+
+def test_full_capacity_retrofit_reproduces_the_dense_model():
+    """At capacity 1.0 nothing is routed away, so the model must BE the original.
+
+    It is not, by default: every adaptive block's delta is scaled by
+    sigmoid(w_route(x)), which at bias 0 is 0.5 -- seven of twelve layers contribute
+    half of themselves. Training from scratch grows into that; a pretrained backbone
+    just starts damaged, measured at 27.9 -> 51.3 ppl on GPT-2 before a single token
+    is routed away. This is the regression test for that.
+    """
+    damaged = _routed_vs_dense(0.0)
+    restored = _routed_vs_dense(4.0)
+    assert restored < damaged / 5, (
+        f"a high route_bias_init should nearly reproduce the dense model: "
+        f"max|dlogit| {restored:.4f} with bias 4.0 vs {damaged:.4f} with bias 0.0")
+
+
+def test_gpt2_config_defaults_to_a_neutral_router():
+    cfg = gpt2_config("gpt2")
+    assert cfg.route_bias_init >= 4.0, (
+        "retrofits must start as the pretrained function, not a halved one")
+    assert AMTConfig().route_bias_init == 0.0, "from-scratch behaviour must not change"
