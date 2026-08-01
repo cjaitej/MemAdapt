@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from agpt.data import SegmentLoader, make_random_shard
+from agpt.data import loaders
 from agpt.data.loaders import resolve_data_dir
 
 
@@ -87,7 +88,37 @@ def test_resolve_data_dir_passes_through_an_existing_dir(shards):
     assert resolve_data_dir(shards) == shards
 
 
-def test_resolve_data_dir_reports_what_it_looked_for(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
+# The three branches below are parametrised on `find_shard_dirs` rather than on the
+# real filesystem. The earlier version of this test just pointed at a missing path and
+# expected a raise, which passed on a laptop and failed on Kaggle -- where the attached
+# dataset IS a discoverable shard directory, so `resolve_data_dir` correctly redirected
+# to it instead of raising. A test that depends on the machine having no corpus on it
+# is testing the machine.
+
+def test_resolve_data_dir_raises_when_nothing_is_findable(tmp_path, monkeypatch):
+    monkeypatch.setattr(loaders, "find_shard_dirs", lambda *a, **k: [])
     with pytest.raises(FileNotFoundError, match="no token shards"):
+        resolve_data_dir(str(tmp_path / "nope"))
+
+
+def test_resolve_data_dir_redirects_to_the_only_candidate(tmp_path, monkeypatch,
+                                                          shards):
+    """One usable corpus on the machine: take it, and say so loudly.
+
+    This is the branch that saves a Kaggle run whose dataset mounted under a slug-based
+    path nobody could have typed from memory.
+    """
+    monkeypatch.setattr(loaders, "find_shard_dirs", lambda *a, **k: [shards])
+    assert resolve_data_dir(str(tmp_path / "nope")) == shards
+
+
+def test_resolve_data_dir_refuses_to_guess_between_several(tmp_path, monkeypatch):
+    """Several candidates: refuse and list them.
+
+    Silently picking one would change what an experiment trained on, which is the kind
+    of thing that surfaces as an unreproducible result rather than as an error.
+    """
+    monkeypatch.setattr(loaders, "find_shard_dirs",
+                        lambda *a, **k: ["/corpus/a", "/corpus/b"])
+    with pytest.raises(FileNotFoundError, match="/corpus/a"):
         resolve_data_dir(str(tmp_path / "nope"))
