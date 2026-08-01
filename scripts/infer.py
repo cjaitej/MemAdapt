@@ -1,280 +1,107 @@
-"""Load a trained checkpoint and see what it does.
+"""Sample from a checkpoint and show how deep each token went.
 
-    python scripts/infer.py eval     runs/r1_b6_amt_joint --data-dir DATA
-    python scripts/infer.py generate runs/r1_b6_amt_joint --prompt "The key idea is"
+    python scripts/infer.py --ckpt runs/s3_joint/best.pt --prompt "The capital of"
+    python scripts/infer.py --ckpt runs/s3_joint/best.pt --show-depth
 
-Three things about this model make naive inference quietly wrong, so they are handled
-here rather than left to the caller.
+An aggregate depth of 6.2 layers/token tells you the model is cheaper. It does not
+tell you it is cheaper *for the right tokens*, which is the actual claim. Printing the
+depth beside the text does: function words, punctuation and the second half of a
+predictable word should be shallow, and content words at the start of a clause should
+not. If the depth pattern looks like noise, the average is a budget the router hit
+rather than a decision it made.
 
-1. ROUTER THRESHOLDS MUST BE CALIBRATED. Training selects tokens with a top-k over
-   the whole sequence, which peeks at the future and cannot be used to generate. The
-   causal path thresholds the auxiliary predictor instead, and that threshold is
-   meaningless until calibrated against real data (routers.py::calibrate). An
-   uncalibrated router still runs and still emits fluent-looking text -- it just
-   routes at whatever rate the aux head happens to produce, which is not the model
-   that was trained. The threshold buffer is persistent, so a checkpoint saved after
-   an eval carries a calibrated one; this script checks and warns when it does not.
-
-2. GENERATION NEVER WRITES TO THE MEMORY BANK. `AMT.generate` reads from the bank but
-   does not write to it, so for a memory variant an empty bank means the retrieval
-   path contributes exactly nothing and you are looking at a depth-routed model with
-   extra steps. `--context` fills the bank from a passage first, which is what makes
-   the memory half observable at all.
-
-3. THE VOCAB IS PADDED. vocab_size is 50304 (a multiple of 128) but GPT-2 BPE only
-   defines 50257, so ids 50257-50303 are trainable-but-never-observed and cannot be
-   decoded. They are filtered on decode and reported if they appear.
+One vocabulary trap: `vocab_size` is padded to a multiple of 128 for tensor-core
+alignment, so the model can sample an id that GPT-2's BPE has no token for. Those are
+replaced rather than crashed on, and counted -- a nonzero count on a trained model
+means the head is putting mass on tokens that do not exist.
 """
 
-import argparse
-import glob
-import math
 import os
 import sys
 
+# `python scripts/x.py` puts scripts/ on sys.path, not the repo root, so `agpt` is not
+# importable without this. Two lines here beats requiring `pip install -e .` before the
+# first run.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import argparse
+
 import torch
 
-sys.path.insert(0, ".")
+from agpt.evaluate import load_checkpoint
 
-from amt.data import DocSegmentLoader  # noqa: E402
-from amt.model import AMT  # noqa: E402
-from amt.model.amt import strip_compile_prefix  # noqa: E402
-from amt.model.routers import TopKTokenRouter  # noqa: E402
-from amt.precision import describe_device, select_precision  # noqa: E402
-from amt.train import evaluate  # noqa: E402
-
-GPT2_VOCAB = 50257          # real BPE size; the config pads this to 50304
+# 24-step blue ramp reused as a terminal background: deeper = darker.
+DEPTH_BG = [17, 18, 19, 20, 21, 25, 26, 27, 32, 33, 39, 45]
 
 
-def resolve_ckpt(path, prefer_best=True):
-    """Accept a run directory or a checkpoint file.
-
-    Prefers `best.pt` when a run directory is given: the newest periodic checkpoint
-    is whatever step training happened to stop at, which is rarely the one you want
-    to evaluate. Pass the file path explicitly to override.
-    """
-    if os.path.isfile(path):
-        return path
-    best = os.path.join(path, "best.pt")
-    if prefer_best and os.path.exists(best):
-        return best
-    ckpts = sorted(glob.glob(os.path.join(path, "ckpt_*.pt")))
-    if not ckpts:
-        # Say what IS there. A run directory with no checkpoint usually means the
-        # run died early, or that this is a fresh session and the checkpoints live
-        # somewhere the working directory was not carried over from.
-        siblings = sorted(
-            os.path.dirname(p) for p in
-            glob.glob(os.path.join(os.path.dirname(path) or ".", "*", "*.pt")))
-        detail = ("\nRun directories that do have checkpoints:\n"
-                  + "\n".join(f"  {s}" for s in dict.fromkeys(siblings))
-                  if siblings else "")
-        raise FileNotFoundError(f"no best.pt or ckpt_*.pt in {path}{detail}")
-    return ckpts[-1]
-
-
-def load_model(path, device, prefer_best=True):
-    ckpt_path = resolve_ckpt(path, prefer_best)
-    ck = torch.load(ckpt_path, map_location=device, weights_only=False)
-    cfg = ck["config"]
-    model = AMT(cfg).to(device).eval()
-    model.load_state_dict(strip_compile_prefix(ck["model"]))
-    val = ck.get("val_loss")
-    print(f"loaded      : {os.path.basename(ckpt_path)} (step {ck.get('step', '?')}"
-          + (f", val_loss {val:.4f}" if val is not None else "") + ")")
-    print(f"variant     : {ck.get('args', {}).get('variant', '?')}  "
-          f"params {model.num_params()/1e6:.2f}M non-embedding")
-    return model, cfg, ck
-
-
-def routers_of(model):
-    return [m for m in model.modules() if isinstance(m, TopKTokenRouter)]
-
-
-def check_calibration(model, data_dir, cfg, device, bank, B, recalibrate=True):
-    """Warn on, and optionally fix, uncalibrated router thresholds.
-
-    A threshold still sitting at its init of exactly 0.0 means sigmoid(logit) > 0.0 is
-    true for every token, so the router selects everything and the causal path routes
-    at rate 1.0 -- dense, silently.
-    """
-    routers = routers_of(model)
-    if not routers:
-        return
-    stale = [r.name for r in routers if float(r.threshold) == 0.0]
-    if stale:
-        print(f"WARNING     : uncalibrated thresholds on {', '.join(stale)}")
-
-    if not (recalibrate and data_dir):
-        if stale:
-            print("              pass --data-dir to calibrate; routing is not "
-                  "trustworthy until you do")
-        return
-
-    loader = DocSegmentLoader(data_dir, B, cfg.block_size, split="val", shuffle=False)
-    batches = [loader.next_batch()[0] for _ in range(3)]
-    if bank is not None:
-        bank.clear()
-    rates = model.calibrate_routers(batches, device=device, bank=bank)
-    if bank is not None:
-        bank.clear()
-    print("calibrated  : " + "  ".join(f"{k}={float(v):.3f}" for k, v in rates.items()))
-
-
-def warm_bank(model, bank, ids, cfg, device):
-    """Fill the memory bank from a context passage, segment by segment.
-
-    Mirrors training: forward a segment, then write it. Never write before the
-    forward that consumes it, or the model retrieves the tokens it is predicting.
-    """
-    if bank is None:
-        return 0
-    bank.clear()
-    T = cfg.block_size
-    written = 0
-    with torch.no_grad():
-        for s in range(0, len(ids), T):
-            seg = ids[s:s + T]
-            if len(seg) < 8:                     # a scrap of a segment is not worth a write
-                break
-            x = torch.tensor(seg, dtype=torch.long, device=device).unsqueeze(0)
-            x = x.expand(bank.B, -1).contiguous()
-            _, _, _, kv = model(x, bank=bank)
-            model.write_memory(bank, kv)
-            written += len(seg)
-    print(f"bank warmed : {written} tokens, fill={float(bank.fill.float().mean()):.0f}"
-          f"/{bank.capacity}")
-    return written
-
-
-def generate(model, cfg, enc, args, device, bank):
-    """Sample, collecting the routing decision made for each generated token."""
-    per_token = {r.name: [] for r in routers_of(model)}
-
-    def hook(mod, inp, out):
-        # The decision that matters for generation is the one at the last position:
-        # that is the token about to be emitted.
-        per_token[mod.name].append(float(out["mask"][:, -1].float().mean()))
-
-    handles = [r.register_forward_hook(hook) for r in routers_of(model)]
-    ids = enc.encode(args.prompt)
-    n_bad, n_new = 0, 0
-    try:
-        for i in range(args.num_samples):
-            idx = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
-            # Distinct seed per sample: reusing one makes every sample identical and
-            # makes a degenerate model look deceptively consistent.
-            gen = torch.Generator(device=device).manual_seed(args.seed + i)
-            out = model.generate(idx, args.max_new_tokens,
-                                 temperature=args.temperature, top_k=args.top_k,
-                                 bank=bank, generator=gen)
-
-            new = out[0, len(ids):].tolist()
-            n_bad += sum(1 for t in new if t >= GPT2_VOCAB)
-            n_new += len(new)
-            text = enc.decode([t for t in new if t < GPT2_VOCAB])
-            label = (f" sample {i + 1}/{args.num_samples} "
-                     if args.num_samples > 1 else " ")
-            print(f"\n{('-' * 8) + label:-<70}\n{args.prompt}{text}")
-    finally:
-        for h in handles:
-            h.remove()
-    print("-" * 70)
-
-    if n_bad:
-        print(f"note: {n_bad}/{n_new} sampled ids were in the padded vocab "
-              f"({GPT2_VOCAB}-{cfg.vocab_size-1}) and were dropped on decode. "
-              f"Expected early in training; persistent means the head has mass on "
-              f"tokens that never occur.")
-
-    if per_token and any(per_token.values()):
-        print("\nrouting during generation (fraction of generated tokens taking "
-              "each path)")
-        for name, vals in per_token.items():
-            if not vals:
-                continue
-            target = (cfg.mem_capacity if name == "mem_router" else cfg.depth_capacity)
-            print(f"  {name:<20} {sum(vals)/len(vals):.3f}   (trained capacity "
-                  f"{target:.2f})")
-        print("A rate far from the trained capacity means the causal threshold does "
-              "not\nreproduce the top-k selection -- check agree/* from training.")
-
-
-def run_eval(model, cfg, args, device, bank):
-    device_type = "cuda" if device.startswith("cuda") else "cpu"
-    amp_dtype, _, _ = select_precision(device, verbose=False)
-    loader = DocSegmentLoader(args.data_dir, args.batch_size, cfg.block_size,
-                              split="val", shuffle=False)
-    loss, stats = evaluate(model, loader, bank, device, device_type,
-                           steps=args.eval_steps, raw_model=model, amp_dtype=amp_dtype)
-    print(f"\nval loss    : {loss:.4f}   ppl {math.exp(min(loss, 20)):.2f}   "
-          f"({args.eval_steps} x {args.batch_size} x {cfg.block_size} tokens)")
-    for k in sorted(stats):
-        print(f"  {k:<24} {stats[k]:.4f}")
-    if any(k.startswith("agree/") for k in stats):
-        print("\nagree/* below ~0.85 means the model you would generate with is not "
-              "the model\nthat was trained (routers.py). Read it before trusting any "
-              "sample above.")
+def color_for(depth, n_layer):
+    """xterm-256 background for a depth, light (shallow) to dark (deep)."""
+    i = min(int(depth / max(n_layer, 1) * len(DEPTH_BG)), len(DEPTH_BG) - 1)
+    return DEPTH_BG[i]
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = ap.add_subparsers(dest="mode", required=True)
-
-    common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("run", help="run directory or a ckpt_*.pt path")
-    common.add_argument("--data-dir", default="data/fineweb_edu_docs")
-    common.add_argument("--batch-size", type=int, default=4)
-    common.add_argument("--no-calibrate", action="store_true",
-                        help="trust the checkpoint's saved thresholds")
-    common.add_argument("--last", action="store_true",
-                        help="use the newest periodic checkpoint instead of best.pt")
-
-    e = sub.add_parser("eval", parents=[common], help="val loss and routing telemetry")
-    e.add_argument("--eval-steps", type=int, default=40)
-
-    g = sub.add_parser("generate", parents=[common], help="sample text")
-    g.add_argument("--prompt", default="The most important idea in this paper is")
-    g.add_argument("--context", default=None,
-                   help="passage (or a .txt path) used to fill the memory bank "
-                        "before generating. Without it a memory variant retrieves "
-                        "from an empty bank and the memory half does nothing")
-    g.add_argument("--max-new-tokens", type=int, default=200)
-    g.add_argument("--num-samples", type=int, default=4,
-                   help="one sample says little about a model; each uses seed+i")
-    g.add_argument("--temperature", type=float, default=0.8)
-    g.add_argument("--top-k", type=int, default=50)
-    g.add_argument("--seed", type=int, default=1337)
+    ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--prompt", default="The")
+    ap.add_argument("--tokens", type=int, default=120)
+    ap.add_argument("--temperature", type=float, default=0.8)
+    ap.add_argument("--top-k", type=int, default=50)
+    ap.add_argument("--samples", type=int, default=1)
+    ap.add_argument("--seed", type=int, default=1337)
+    ap.add_argument("--show-depth", action="store_true",
+                    help="colour each generated token by the depth it was given")
+    ap.add_argument("--exit-mode", default=None)
     args = ap.parse_args()
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"device      : {describe_device()}")
-    model, cfg, _ = load_model(args.run, device, prefer_best=not args.last)
-
-    amp_dtype, _, _ = select_precision(device, verbose=False)
-    # Generation runs one sequence; eval runs a batch. The bank is allocated for a
-    # fixed batch size and asserts on it, so calibration must use the same one.
-    bank_B = args.batch_size if args.mode == "eval" else 1
-    bank = model.make_bank(bank_B, device, dtype=amp_dtype) if cfg.use_memory else None
-
-    check_calibration(model, args.data_dir, cfg, device, bank,
-                      B=bank_B, recalibrate=not args.no_calibrate)
-
-    if args.mode == "eval":
-        run_eval(model, cfg, args, device, bank)
-        return
 
     import tiktoken
     enc = tiktoken.get_encoding("gpt2")
-    if args.context:
-        text = (open(args.context).read() if os.path.exists(args.context)
-                else args.context)
-        warm_bank(model, bank, enc.encode(text), cfg, device)
-    elif cfg.use_memory:
-        print("note        : no --context, so the bank is empty and retrieval "
-              "contributes nothing")
-    generate(model, cfg, enc, args, device, bank)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    over = {"exit_mode": args.exit_mode} if args.exit_mode else {}
+    model, cfg, _ = load_checkpoint(args.ckpt, device, **over)
+
+    ids = enc.encode_ordinary(args.prompt)
+    prompt = torch.tensor([ids], dtype=torch.long, device=device)
+    print(f"model: {cfg.exit_mode}, {cfg.n_layer} layers, "
+          f"min depth {cfg.min_depth}\n")
+
+    undecodable = 0
+    for s in range(args.samples):
+        gen = torch.Generator(device=device).manual_seed(args.seed + s)
+        # One token at a time so each forward's reported depth belongs to exactly one
+        # generated token. `generate` already re-runs the whole context every step --
+        # there is no KV cache in this model -- so this costs nothing extra.
+        out, depths = model.generate(prompt, args.tokens, temperature=args.temperature,
+                                     top_k=args.top_k, generator=gen,
+                                     return_depth=True)
+        new_ids = out[0, len(ids):].tolist()
+
+        print(f"--- sample {s + 1} " + "-" * 50)
+        print(f"\033[1m{args.prompt}\033[0m", end="")
+        for tok, depth in zip(new_ids, [float(d) for d in depths]):
+            try:
+                piece = enc.decode([tok])
+            except Exception:                              # noqa: BLE001
+                undecodable += 1
+                piece = "�"
+            if args.show_depth:
+                bg = color_for(depth, cfg.n_layer)
+                print(f"\033[48;5;{bg}m\033[38;5;255m{piece}\033[0m", end="")
+            else:
+                print(piece, end="")
+        mean_depth = sum(float(d) for d in depths) / max(len(depths), 1)
+        print(f"\n\n[mean depth {mean_depth:.2f} of {cfg.n_layer}]\n")
+
+    if args.show_depth:
+        print("depth scale: ", end="")
+        for i in range(cfg.n_layer + 1):
+            print(f"\033[48;5;{color_for(i, cfg.n_layer)}m\033[38;5;255m{i:3d}\033[0m",
+                  end="")
+        print("  (layers computed)")
+    if undecodable:
+        print(f"\n{undecodable} sampled ids had no GPT-2 token (vocab is padded to "
+              f"{cfg.vocab_size}); shown as �")
 
 
 if __name__ == "__main__":

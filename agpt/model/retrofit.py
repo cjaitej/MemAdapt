@@ -1,48 +1,55 @@
-"""Load pretrained GPT-2 into the AMT stack, then freeze everything it brought.
+"""Load pretrained GPT-2 into the AdaptiveGPT stack, then freeze what it brought.
 
-    from amt.model.retrofit import gpt2_config, from_gpt2, freeze_backbone
+    from agpt.model.retrofit import gpt2_config, from_gpt2, freeze_backbone
 
     cfg = gpt2_config("gpt2", block_size=1024)
     model, report = from_gpt2("gpt2", cfg)
-    freeze_backbone(model)
+    freeze_backbone(model, train_head=True)
 
 Why this is a rename and not a port
 -----------------------------------
 `blocks.py` kept nanoGPT's parameter names, which are HuggingFace's names for GPT-2,
-so every tensor in `GPT2LMHeadModel` has exactly one counterpart here. Two mechanical
-differences, and nothing else:
+so every tensor in `GPT2LMHeadModel` has exactly one counterpart here -- at the same
+key. There is one mechanical difference and nothing else: OpenAI's checkpoints store
+the four projection weights as `Conv1D`, which is a Linear with its axes swapped, so
+those four are transposed on the way in.
 
-* `AdaptiveBlock` wraps the real block, so its tensors sit one level deeper under
-  `.block.`. That is the only key rewriting this does.
-* OpenAI's checkpoints store the four projection weights as `Conv1D`, which is a
-  Linear with its axes swapped, so those four are transposed on the way in.
+(This is simpler than it was under the per-layer-skip design, which wrapped each
+routable block in an adapter and had to rewrite every key underneath it. Early exit
+needs no wrapper: the exit routers hang off the model, not off the blocks.)
 
-What AMT adds -- the routers, the fusion gate, the softmax temperature -- has no GPT-2
-counterpart and keeps its own initialisation. At `gpt2` that is **21,559 parameters,
-0.017% of the backbone**. Freezing the rest is what makes "base vs ours" an exact
-comparison: both arms run byte-identical pretrained weights, and the only difference
-is the routing and retrieval this project contributes.
+What AdaptiveGPT adds -- one small MLP per routable layer -- has no GPT-2 counterpart
+and keeps its own initialisation. At `gpt2` that is a few hundred thousand parameters
+against a 124M backbone. Freezing the rest is what makes "base vs ours" an exact
+comparison: both arms run byte-identical pretrained weights and differ only in the
+routing this project contributes.
+
+The one thing you almost certainly have to unfreeze
+---------------------------------------------------
+`ln_f` and `lm_head` have only ever seen final-layer representations. An early-exited
+token arrives at them carrying a mid-stack representation, which is a distribution the
+head has never been trained to read, and no amount of router quality fixes that. Pass
+`train_head=True` unless you are specifically measuring how far a frozen head can be
+pushed -- and report which you did, because "the head had to be retrained" is a finding
+about the mechanism, not a detail of the setup.
 
 The vocabulary decision
 -----------------------
 `gpt2_config` uses vocab_size 50257, not the 50304 the from-scratch configs pad to.
 Padding is free when the rows are trained from scratch, but here the extra 47 rows
-would arrive randomly initialised into an otherwise-pretrained head, and a softmax
-does not know they are not real tokens -- they take probability mass from the ones
-that are, which shows up as a perplexity gap that has nothing to do with routing.
-Pass `vocab_size=50304` explicitly if you want the tensor-core alignment back and are
+would arrive randomly initialised into an otherwise-pretrained head, and a softmax does
+not know they are not real tokens -- they take probability mass from the ones that are,
+which shows up as a perplexity gap that has nothing to do with routing. Pass
+`vocab_size=50304` explicitly if you want the tensor-core alignment back and are
 willing to pay for it in the comparison.
 """
 
-import re
-
 import torch
 
-from .amt import AMT
-from .config import AMTConfig
+from .adaptive_gpt import AdaptiveGPT
+from .config import AdaptiveGPTConfig
 
-# n_layer / n_head / n_embd for each OpenAI checkpoint. Same table as
-# train_gpt2.py::GPT.from_pretrained, which is where this approach comes from.
+# n_layer / n_head / n_embd for each OpenAI checkpoint.
 GPT2_SHAPES = {
     "gpt2":        dict(n_layer=12, n_head=12, n_embd=768),     # 124M
     "gpt2-medium": dict(n_layer=24, n_head=16, n_embd=1024),    # 350M
@@ -57,8 +64,8 @@ TRANSPOSED = ("attn.c_attn.weight", "attn.c_proj.weight",
 # Buffers, not parameters: the causal mask and its -inf twin.
 HF_SKIP = (".attn.bias", ".attn.masked_bias")
 
-# Everything AMT adds on top of GPT-2. Matched against parameter names.
-NEW_MODULES = (".router.", ".mem_router.", ".w_gate.", ".log_temp")
+# Everything AdaptiveGPT adds on top of GPT-2. Matched against parameter names.
+NEW_MODULES = ("routers.",)
 
 # wte and lm_head are the same tensor here (weight tying), and named_parameters()
 # yields a shared tensor once -- under whichever name was registered first, which is
@@ -68,33 +75,24 @@ NEW_MODULES = (".router.", ".mem_router.", ".w_gate.", ".log_temp")
 TIED_ALIASES = {"lm_head.weight": "transformer.wte.weight"}
 
 
-def gpt2_config(model_type="gpt2", **overrides) -> AMTConfig:
-    """An AMTConfig shaped like a GPT-2 checkpoint.
+def gpt2_config(model_type="gpt2", **overrides) -> AdaptiveGPTConfig:
+    """An AdaptiveGPTConfig shaped like a GPT-2 checkpoint.
 
-    Routing and memory settings keep their AMTConfig defaults, so the retrofit is
-    configured exactly like any other variant -- pass `route_depth=False`,
-    `use_memory=False`, `couple=False` and so on to build the ablation arms.
+    Routing settings keep their defaults, so the retrofit is configured exactly like
+    any other arm -- pass `exit_mode="dense"` and so on to build the baselines.
+
+    `n_min_layers` scales with depth rather than staying at 3. The always-on prefix
+    exists so the router sees a contextualised representation, and "how many layers
+    until the stream says something useful" tracks the stack, not a constant: a
+    24-layer model that starts routing at layer 3 is routing on noise.
     """
     if model_type not in GPT2_SHAPES:
         raise KeyError(f"unknown {model_type!r}; known: {sorted(GPT2_SHAPES)}")
     kw = dict(GPT2_SHAPES[model_type])
-    # route_bias_init=4.0 -> sigmoid(4) = 0.982, so at capacity 1.0 the retrofit IS
-    # the pretrained model and every measurement starts from the base rather than
-    # from a halved one. Measured: at cap 1.0 the default 0.0 scores 51.3 ppl against
-    # the base's 27.9, and 4.0 restores it to 28.5. Raise it for a closer identity at
-    # the cost of router gradient (sigmoid saturates); lower it to keep the router
-    # more plastic at the cost of starting further from the base.
-    kw.update(vocab_size=50257, block_size=1024, bias=True, route_bias_init=4.0)
+    kw.update(vocab_size=50257, block_size=1024, bias=True,
+              n_min_layers=max(2, kw["n_layer"] // 4))
     kw.update(overrides)
-    return AMTConfig(**kw)
-
-
-def _to_amt_key(key, adaptive):
-    """HF key -> AMT key. Only adaptive layers move, and only by one level."""
-    m = re.match(r"transformer\.h\.(\d+)\.(.+)$", key)
-    if m and int(m.group(1)) in adaptive:
-        return f"transformer.h.{m.group(1)}.block.{m.group(2)}"
-    return key
+    return AdaptiveGPTConfig(**kw)
 
 
 @torch.no_grad()
@@ -107,10 +105,9 @@ def load_gpt2_state_dict(model, hf_state):
     Source dimensions are read off the tensors, never assumed: a checkpoint with a
     shorter position table or a smaller vocabulary than the target config is a
     legitimate thing to load, and silently mismatching either is the kind of bug that
-    surfaces 6 hours into a training run as "the retrofit is worse than the base".
+    surfaces six hours into a training run as "the retrofit is worse than the base".
     """
     cfg = model.config
-    adaptive = set(cfg.adaptive_layers)
     target = dict(model.named_parameters())
     loaded, missing = [], []
 
@@ -130,7 +127,7 @@ def load_gpt2_state_dict(model, hf_state):
     for key, value in hf_state.items():
         if key.endswith(HF_SKIP):
             continue
-        name = TIED_ALIASES.get(key, _to_amt_key(key, adaptive))
+        name = TIED_ALIASES.get(key, key)
         if name not in target:
             missing.append(key)
             continue
@@ -143,9 +140,8 @@ def load_gpt2_state_dict(model, hf_state):
             # head of it is exactly the embedding for a shorter context.
             value = value[:cfg.block_size]
         if name in ("transformer.wte.weight", "lm_head.weight"):
-            # wte and lm_head are the same tensor here (weight tying), so this runs
-            # twice and writes the same rows twice -- harmless, and cheaper than
-            # special-casing which of the two HF happens to emit first.
+            # Tied, so this runs twice and writes the same rows twice -- harmless, and
+            # cheaper than special-casing which of the two HF happens to emit first.
             if cfg.vocab_size > src_vocab:
                 param[:src_vocab].copy_(value)
                 loaded.append(name)
@@ -169,7 +165,7 @@ def load_gpt2_state_dict(model, hf_state):
 
 
 def from_gpt2(model_type="gpt2", config=None, device="cpu"):
-    """Build an AMT at GPT-2's shape and fill it with the pretrained weights."""
+    """Build an AdaptiveGPT at GPT-2's shape and fill it with pretrained weights."""
     try:
         from transformers import GPT2LMHeadModel
         from transformers.utils import logging as hf_logging
@@ -178,10 +174,9 @@ def from_gpt2(model_type="gpt2", config=None, device="cpu"):
                          "    pip install transformers") from e
 
     # Silence the per-tensor "Materializing param=..." bar. It redraws once per
-    # parameter -- ~150 times per model -- and a progress bar is only a progress bar
-    # on a terminal. Piped into a log (scripts/train_pair.py merges stderr and runs
-    # unbuffered) every redraw becomes its own line, burying the training output it
-    # is printed next to.
+    # parameter -- ~150 times per model -- and a progress bar is only a progress bar on
+    # a terminal. Piped into a log every redraw becomes its own line, burying the
+    # training output it is printed next to.
     hf_logging.disable_progress_bar()
 
     cfg = config or gpt2_config(model_type)
@@ -191,7 +186,7 @@ def from_gpt2(model_type="gpt2", config=None, device="cpu"):
             raise ValueError(f"config {k}={getattr(cfg, k)} does not match "
                              f"{model_type}'s {v}")
 
-    model = AMT(cfg)
+    model = AdaptiveGPT(cfg)
     hf = GPT2LMHeadModel.from_pretrained(model_type)
     report = load_gpt2_state_dict(model, hf.state_dict())
     del hf
@@ -199,28 +194,34 @@ def from_gpt2(model_type="gpt2", config=None, device="cpu"):
 
 
 def is_new_module(name):
-    """True for a parameter AMT adds on top of GPT-2."""
+    """True for a parameter AdaptiveGPT adds on top of GPT-2."""
     return any(marker in name for marker in NEW_MODULES)
 
 
-def freeze_backbone(model, train_layernorms=False, train_memory_block=False):
+def freeze_backbone(model, train_head=False, train_layernorms=False):
     """Train only what the retrofit adds; hold the pretrained weights fixed.
 
-    `train_layernorms` and `train_memory_block` are the first two rungs of the
-    mitigation ladder for the risk that a linear router cannot find routing signal in
-    features that were never shaped for it. Both are cheap next to the backbone, and
-    using either is a result to report rather than a knob to quietly turn: "the
-    routers could not learn on frozen features alone" is a finding about the
-    mechanism, not about the training setup.
+    `train_head` releases `ln_f` and the tied `lm_head`/`wte`. Read the module
+    docstring before leaving it off -- a frozen head has never seen a mid-stack
+    representation, and that is usually the binding constraint on a retrofit, not the
+    router.
+
+    `train_layernorms` releases the per-block LayerNorms too. Cheap next to the
+    backbone, and the next rung to reach for if the routers cannot find signal in
+    frozen features. Using either is a result to report rather than a knob to quietly
+    turn.
+
+    Note that `lm_head.weight` and `transformer.wte.weight` are the same tensor, so
+    releasing the head releases the input embedding with it. That is unavoidable under
+    weight tying and worth knowing before reading the trainable-parameter count.
     """
-    mem_prefix = f"transformer.h.{model.config.mem_layer}."
+    head_names = {"lm_head.weight", "transformer.wte.weight"}
     trainable, frozen = 0, 0
     for name, param in model.named_parameters():
         train = is_new_module(name)
-        if train_layernorms and (".ln_1." in name or ".ln_2." in name
-                                 or name.startswith("transformer.ln_f.")):
+        if train_head and (name.startswith("transformer.ln_f.") or name in head_names):
             train = True
-        if train_memory_block and name.startswith(mem_prefix):
+        if train_layernorms and (".ln_1." in name or ".ln_2." in name):
             train = True
         param.requires_grad = train
         if train:

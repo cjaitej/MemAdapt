@@ -2,8 +2,8 @@
 #   pip install torch --index-url https://download.pytorch.org/whl/cu128
 torch>=2.6
 
-# REQUIRED on Windows for torch.compile. Without it routing is SLOWER than dense and
-# every efficiency claim in the project inverts -- see docs/DESIGN_NOTES.md section 1.
+# REQUIRED on Windows for torch.compile. Without it the routing bookkeeping can cost
+# more than the skipped layers save -- see docs/DESIGN_NOTES.md section 1.
 triton-windows; sys_platform == "win32"
 
 numpy>=1.26
@@ -11,12 +11,14 @@ tiktoken>=0.7
 tqdm>=4.66
 pytest>=8.0
 
-# Only needed by amt/data/prepare.py --dataset fineweb
+# agpt/data/prepare.py, for every corpus except --dataset local
 datasets>=2.20
 
-# Optional: transformers is used by GPT.from_pretrained for the retrofit demo
+# The GPT-2 retrofit (agpt/model/retrofit.py)
 transformers>=4.40
+
+# scripts/figures.py
 matplotlib>=3.8
 
-# Only needed by scripts/app.py, the checkpoint playground
+# scripts/app.py, the per-token depth viewer
 streamlit>=1.40

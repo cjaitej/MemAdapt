@@ -1,105 +1,112 @@
-"""Checkpoints must load into a plain AMT, whatever wrapper wrote them.
+"""Checkpoint round-trips, including the ones the three-stage pipeline depends on."""
 
-`torch.compile` returns an OptimizedModule, and its `state_dict()` prefixes every
-key with `_orig_mod.`. Saving that handle produced checkpoints that nothing could
-load -- not `--resume latest`, not inference, not the analysis scripts. The failure
-only appears under `--compile`, so it survived every uncompiled test run and only
-surfaced when a real run needed reloading.
-
-These tests pin both halves: the prefix is stripped on load, and training saves the
-unwrapped module in the first place.
-"""
-
-import os
-
+import pytest
 import torch
 
-from amt.model import AMT, variant
-from amt.model.amt import strip_compile_prefix
+from agpt.evaluate import load_checkpoint
+from agpt.model.adaptive_gpt import strip_compile_prefix
+from conftest import build, randomise_routers
 
 
-def tiny():
-    return variant("b6_amt_joint", n_layer=4, n_embd=64, n_head=4, block_size=32,
-                   vocab_size=128, n_trunk=1, n_dense_tail=1, mem_size=32,
-                   n_neighbors=4, mem_query_chunk=16, ce_chunks=1)
+def save(model, cfg, path, step=0):
+    torch.save({"model": model.state_dict(), "config": cfg, "step": step,
+                "val_loss": 1.0, "args": {}}, path)
+    return str(path)
 
 
-def test_clean_state_dict_passes_through_unchanged():
-    sd = AMT(tiny()).state_dict()
-    assert strip_compile_prefix(sd) is sd, "no prefix means no copy"
+def test_round_trip_preserves_the_function(tokens, tmp_path):
+    model, cfg = build("adaptive")
+    randomise_routers(model)
+    path = save(model, cfg, tmp_path / "ck.pt")
+
+    loaded, _, _ = load_checkpoint(path)
+    with torch.no_grad():
+        a, _, _ = model(tokens, return_logits=True)
+        b, _, _ = loaded(tokens, return_logits=True)
+    assert torch.equal(a, b)
 
 
-def test_compiled_prefix_is_stripped():
-    sd = AMT(tiny()).state_dict()
-    wrapped = {f"_orig_mod.{k}": v for k, v in sd.items()}
-    assert set(strip_compile_prefix(wrapped)) == set(sd)
+def test_compile_prefix_is_stripped():
+    """A checkpoint saved from a compiled handle must still load.
 
-
-def test_a_compiled_checkpoint_loads_into_a_plain_model():
-    """The end-to-end failure: a --compile run's checkpoint reloaded for inference."""
-    cfg = tiny()
-    trained = AMT(cfg)
-    with torch.no_grad():                      # make the weights distinguishable
-        for p in trained.parameters():
-            p.add_(torch.randn_like(p) * 0.01)
-
-    # Exactly what torch.compile's OptimizedModule.state_dict() emits.
-    as_saved = {f"_orig_mod.{k}": v for k, v in trained.state_dict().items()}
-
-    fresh = AMT(cfg)
-    fresh.load_state_dict(strip_compile_prefix(as_saved))
-    for a, b in zip(trained.state_dict().values(), fresh.state_dict().values()):
-        assert torch.equal(a, b)
-
-
-def test_best_checkpoint_is_not_named_like_a_periodic_one(tmp_path):
-    """`best.pt`, never `ckpt_best.pt` -- two things break if it matches the glob.
-
-    `--resume latest` takes the lexicographically last `ckpt_*.pt`, and "best" sorts
-    after every zero-padded step number, so a resumed run would silently rewind to
-    the best checkpoint instead of continuing from the newest. It would also consume
-    a slot in the pruner's retention window, evicting a real checkpoint.
+    `torch.compile` returns a wrapper whose state_dict namespaces every key under
+    `_orig_mod.`, and nothing downstream -- resume, eval, inference -- can read that.
     """
-    from amt.train import prune_checkpoints
-
-    for step in (500, 1000, 1500):
-        (tmp_path / f"ckpt_{step:06d}.pt").write_bytes(b"x")
-    (tmp_path / "best.pt").write_bytes(b"x")
-
-    prune_checkpoints(str(tmp_path), keep=2)
-
-    survivors = sorted(p.name for p in tmp_path.glob("*.pt"))
-    assert survivors == ["best.pt", "ckpt_001000.pt", "ckpt_001500.pt"], (
-        "pruning must keep the last `keep` periodic checkpoints AND best.pt"
-    )
-
-    # The `--resume latest` selection, reproduced exactly.
-    found = sorted(f for f in os.listdir(tmp_path) if f.startswith("ckpt_"))
-    assert found[-1] == "ckpt_001500.pt", "resume must pick the newest step"
+    model, _ = build("adaptive")
+    prefixed = {f"_orig_mod.{k}": v for k, v in model.state_dict().items()}
+    clean = strip_compile_prefix(prefixed)
+    assert set(clean) == set(model.state_dict())
+    model.load_state_dict(clean)
+    # Idempotent: an already-clean dict must pass through untouched.
+    assert strip_compile_prefix(clean) is clean
 
 
-def test_best_checkpoint_carries_no_optimizer_state():
-    """It is for evaluation, not resuming; optimizer moments would triple its size."""
-    import inspect
+def test_stage1_checkpoint_loads_into_every_arm(tokens, tmp_path):
+    """The pipeline's central move: one backbone, four routing rules.
 
-    from amt import train
-    src = inspect.getsource(train.main)
-    best_save = src.split('-> best.pt')[0].split('if val_loss < best_val:')[-1]
-    assert '"optimizer"' not in best_save
-    assert '"val_loss": val_loss' in best_save
-
-
-def test_training_saves_the_unwrapped_module():
-    """train.py must save raw_model, not the compiled handle.
-
-    Stripping on load covers checkpoints already written, but new ones should not
-    need the workaround at all.
+    Stage 1 saves an adaptive model with routers at their initialisation. `compare.py`
+    then rebuilds that same checkpoint as `dense`, `random` and `fixed`, which means
+    dropping the router tensors -- and rebuilds it back as `adaptive`, which means
+    finding them again. Both directions have to work, and nothing else may go missing.
     """
-    import inspect
+    model, cfg = build("adaptive")
+    randomise_routers(model)
+    path = save(model, cfg, tmp_path / "s1.pt")
 
-    from amt import train
-    src = inspect.getsource(train.main)
-    assert '"model": raw_model.state_dict()' in src, (
-        "checkpoint save must use raw_model.state_dict(); saving the compiled "
-        "handle writes _orig_mod.-prefixed keys"
-    )
+    for mode in ("dense", "random", "fixed"):
+        arm, arm_cfg, _ = load_checkpoint(path, exit_mode=mode)
+        assert arm_cfg.exit_mode == mode
+        assert len(arm.routers) == 0
+        with torch.no_grad():
+            arm(tokens)                      # must run, not just build
+
+    back, back_cfg, _ = load_checkpoint(path, exit_mode="adaptive")
+    assert len(back.routers) == len(cfg.router_layers)
+    with torch.no_grad():
+        a, _, _ = model(tokens, return_logits=True)
+        b, _, _ = back(tokens, return_logits=True)
+    assert torch.equal(a, b), "reloading as adaptive lost the routers"
+
+
+def test_dense_checkpoint_gains_fresh_routers(tokens, tmp_path):
+    """Loading a router-free checkpoint as adaptive leaves the routers at init.
+
+    That is the Stage 1 -> Stage 2 handoff when Stage 1 was run as the `dense` variant
+    rather than as adaptive-with-gates-pinned. It has to work, and it has to start
+    from the deliberate start-dense initialisation rather than from noise.
+    """
+    model, cfg = build("dense")
+    path = save(model, cfg, tmp_path / "d.pt")
+    arm, arm_cfg, _ = load_checkpoint(path, exit_mode="adaptive")
+    assert len(arm.routers) == len(arm_cfg.router_layers)
+    for r in arm.routers.values():
+        assert r.proj.bias.item() == pytest.approx(arm_cfg.router_bias_init)
+
+
+def test_a_genuinely_wrong_checkpoint_is_rejected(tmp_path):
+    """Only router tensors may be missing. A width mismatch must not be tolerated."""
+    model, cfg = build("adaptive")
+    path = save(model, cfg, tmp_path / "ck.pt")
+    with pytest.raises(Exception):
+        load_checkpoint(path, n_embd=128, n_head=4)
+
+
+def test_config_overrides_survive_the_load(tmp_path):
+    model, cfg = build("adaptive")
+    path = save(model, cfg, tmp_path / "ck.pt")
+    _, out, _ = load_checkpoint(path, exit_mode="fixed", fixed_exit_layer=4)
+    assert out.exit_mode == "fixed" and out.fixed_exit_layer == 4
+    assert out.n_embd == cfg.n_embd, "an override leaked into the architecture"
+
+
+def test_config_stored_as_a_dict_still_loads(tokens, tmp_path):
+    """Older checkpoints and hand-written ones store the config as a plain dict."""
+    model, cfg = build("adaptive")
+    path = str(tmp_path / "ck.pt")
+    torch.save({"model": model.state_dict(),
+                "config": {k: v for k, v in cfg.__dict__.items()},
+                "step": 0}, path)
+    loaded, out, _ = load_checkpoint(path)
+    assert out.exit_mode == "adaptive"
+    with torch.no_grad():
+        loaded(tokens)
