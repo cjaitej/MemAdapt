@@ -1,6 +1,6 @@
 """The four-arm comparison: dense, random skip, fixed exit, AdaptiveGPT.
 
-    python scripts/compare.py --ckpt runs/s3_joint/best.pt --data-dir data/wikitext103
+    python scripts/compare.py --ckpt runs/s3_joint/final.pt --data-dir data/wikitext103
 
 Writes `results/compare.json` and prints the table that goes in the writeup.
 
@@ -44,6 +44,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
 import json
+import math
 
 import torch
 
@@ -74,6 +75,64 @@ def match_random_p(target_depth, cfg):
         else:
             hi = mid
     return round((lo + hi) / 2, 6)
+
+
+def pareto_verdict(results):
+    """Does the adaptive arm sit below the fixed-depth frontier at its own cost?
+
+    This is the whole claim, and stating it correctly is fiddly enough to be worth
+    doing in one place.
+
+    A fixed depth is an integer, so no single fixed arm lands at the adaptive arm's
+    exact cost. Comparing against the nearest one is wrong in both directions: against
+    the cheaper neighbour the adaptive arm wins for free (it is simply spending more),
+    and against the dearer neighbour it can lose while still being the better trade.
+    Neither says anything about allocation.
+
+    The right comparison is the *frontier*: the piecewise-linear curve through every
+    uniform-depth model, evaluated at the adaptive arm's FLOP cost. Beating that means
+    per-token allocation buys quality that no constant depth of the same cost can.
+    """
+    ad = results["adaptive"]
+    x, y = ad["flops_frac_layers"], ad["ppl"]
+
+    # The fixed-depth frontier, dense included -- it is just uniform depth n_layer.
+    pts = sorted((results[n]["flops_frac_layers"], results[n]["ppl"], n)
+                 for n in ("fixed", "fixed_hi", "dense") if n in results)
+
+    ref, how = None, ""
+    for (x0, y0, n0), (x1, y1, n1) in zip(pts, pts[1:]):
+        if x0 - 1e-9 <= x <= x1 + 1e-9 and x1 > x0:
+            ref = y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+            how = f"interpolating {n0}@{x0:.1%} and {n1}@{x1:.1%}"
+            break
+    if ref is None:                       # outside the bracket: fall back to nearest
+        x0, y0, n0 = min(pts, key=lambda p: abs(p[0] - x))
+        ref, how = y0, f"nearest fixed arm {n0}@{x0:.1%} (NOT bracketed -- weak)"
+
+    beats_fixed = y < ref
+    beats_random = y < results["random"]["ppl"]
+    lines = [
+        f"fixed-depth frontier at {x:.1%} layer FLOPs: {ref:.2f} ppl  ({how})",
+        f"adaptive                                    : {y:.2f} ppl",
+    ]
+    if beats_fixed:
+        lines.append(f"VERDICT   adaptive is {ref - y:.2f} ppl BELOW the fixed-depth "
+                     "frontier at equal cost.")
+        lines.append("          Per-token allocation buys something constant depth "
+                     "cannot.")
+    else:
+        lines.append(f"VERDICT   adaptive is {y - ref:.2f} ppl ABOVE the fixed-depth "
+                     "frontier at equal cost.")
+        lines.append("          Per-token adaptivity is not paying here -- report "
+                     "that, do not tune it away.")
+    if not beats_random:
+        lines.append("WARNING   adaptive does not beat random skipping at matched "
+                     "depth: the router")
+        lines.append("          has learned to hit a budget, not to allocate.")
+    return {"frontier_ppl": ref, "adaptive_ppl": y, "margin": ref - y,
+            "beats_fixed_frontier": bool(beats_fixed),
+            "beats_random": bool(beats_random), "basis": how, "lines": lines}
 
 
 def main():
@@ -109,16 +168,32 @@ def main():
     print(f"  avg depth {target:.2f} of {cfg.n_layer}")
     del model
 
-    fixed_layer = max(cfg.n_min_layers, min(cfg.n_layer, round(target)))
+    # A fixed depth is an integer and the adaptive arm's mean is not, so no single
+    # fixed arm is iso-cost with it. Rounding to the nearest layer quietly compares
+    # against a CHEAPER model and flatters the adaptive arm: at mean depth 10.26,
+    # round() gives 10, which is 83.3% of dense layer FLOPs against the adaptive arm's
+    # 87.6%. Beating a cheaper baseline on quality is not a Pareto claim.
+    #
+    # So both neighbours are evaluated and the adaptive arm has to sit below the line
+    # joining them. `fixed_lo` is cheaper, `fixed_hi` dearer; if adaptive beats only
+    # `fixed_lo`, it bought its quality with FLOPs rather than with allocation.
+    lo = max(cfg.n_min_layers, min(cfg.n_layer, int(math.floor(target))))
+    hi = max(cfg.n_min_layers, min(cfg.n_layer, int(math.ceil(target))))
     random_p = match_random_p(target, cfg)
+
     arms = {
         "dense": (args.ckpt, dict(exit_mode="dense")),
         "random": (args.finetuned_random or args.ckpt,
                    dict(exit_mode="random", random_continue_p=random_p)),
         "fixed": (args.finetuned_fixed or args.ckpt,
-                  dict(exit_mode="fixed", fixed_exit_layer=fixed_layer)),
+                  dict(exit_mode="fixed", fixed_exit_layer=lo)),
     }
-    print(f"  matched: fixed_exit_layer={fixed_layer}, random_continue_p={random_p}")
+    if hi != lo:
+        arms["fixed_hi"] = (args.finetuned_fixed or args.ckpt,
+                            dict(exit_mode="fixed", fixed_exit_layer=hi))
+    print(f"  matched: fixed_exit_layer={lo}"
+          + (f" and {hi} (bracketing depth {target:.2f})" if hi != lo else "")
+          + f", random_continue_p={random_p}")
 
     for name, (path, overrides) in arms.items():
         print(f"evaluating {name} ...")
@@ -148,13 +223,21 @@ def main():
     print(f"\n{'arm':10s} {'ppl':>8s} {'depth':>7s} {'FLOPs/tok':>11s} "
           f"{'layer':>7s} {'total':>7s} {'tok/s':>10s} {'speedup':>8s}")
     base_tps = results["dense"].get("throughput", {}).get("tokens_per_sec")
-    for name in ("dense", "random", "fixed", "adaptive"):
+    for name in [n for n in ("dense", "random", "fixed", "fixed_hi", "adaptive")
+                 if n in results]:
         r = results[name]
         tps = r.get("throughput", {}).get("tokens_per_sec", float("nan"))
         speed = tps / base_tps if base_tps else float("nan")
         print(f"{name:10s} {r['ppl']:8.2f} {r['avg_depth']:7.2f} "
               f"{r['flops']['total']/1e6:10.1f}M {r['flops_frac_layers']:7.1%} "
               f"{r['flops_frac_total']:7.1%} {tps:10,.0f} {speed:7.2f}x")
+
+    print()
+    verdict = pareto_verdict(results)
+    for line in verdict["lines"]:
+        print(line)
+    results["_verdict"] = {k: v for k, v in verdict.items() if k != "lines"}
+
     print(f"\nwrote {args.out}")
 
 

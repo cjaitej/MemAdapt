@@ -1,7 +1,7 @@
 """Sweep the depth penalty to draw the Pareto curve, one run per GPU.
 
     python scripts/sweep.py --lambdas 0.01 0.03 0.05 0.1 0.2 \
-        --init-from runs/s2_routers/best.pt --out-dir runs/sweep \
+        --init-from runs/s2_routers/final.pt --out-dir runs/sweep \
         --max-steps 3000 -- --compile
 
 Everything after a bare `--` is forwarded verbatim to every `agpt.train` process, so
@@ -144,7 +144,7 @@ def main():
         print(f"FAILED: {failed}  (see <run>/train.log)")
     else:
         print("\nNext:\n"
-              "  for each run:  python scripts/evaluate.py --ckpt <run>/best.pt\n"
+              "  for each run:  python scripts/evaluate.py --ckpt <run>/final.pt\n"
               "  then collect the (ppl, flops_frac_layers) pairs into a JSON list and\n"
               "  pass it to scripts/figures.py --sweep to draw the Pareto curve.")
 

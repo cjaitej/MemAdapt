@@ -7,11 +7,11 @@ you can inspect, evaluate and roll back to:
     python -m agpt.train --stage dense --run-name s1_dense --max-steps 12000
 
     # 2. freeze it, teach the routers where the stack stops mattering
-    python -m agpt.train --stage routers --init-from runs/s1_dense/best.pt \
+    python -m agpt.train --stage routers --init-from runs/s1_dense/final.pt \
         --run-name s2_routers --max-steps 1500
 
     # 3. unfreeze, let the model adapt to being interrupted
-    python -m agpt.train --stage joint --init-from runs/s2_routers/best.pt \
+    python -m agpt.train --stage joint --init-from runs/s2_routers/final.pt \
         --run-name s3_joint --max-steps 3000
 
 Why three stages and not one
@@ -22,6 +22,13 @@ until the representations mean something, and the representations cannot settle 
 half of them are being cut off at a randomly chosen depth. Staged, each phase has a
 stationary target: Stage 2 learns to route a model that is no longer moving, and Stage
 3 adapts a model to routing decisions that are already roughly right.
+
+Chain the stages through `final.pt`, not `best.pt`
+--------------------------------------------------
+`best.pt` selects on validation loss. That is the right criterion for Stage 1 and the
+wrong one afterwards: Stage 2 freezes the backbone, so its loss can only rise as tokens
+begin to exit, and `best.pt` lands on step 0. Chaining off it discards the entire stage
+without a word -- which is exactly what happened on the first full run.
 
 Stage 1 is the dense baseline
 -----------------------------
@@ -52,7 +59,7 @@ from agpt.model import AdaptiveGPT, FlopModel, variant
 from agpt.model.adaptive_gpt import stats_to_floats, strip_compile_prefix
 from agpt.model.config import VARIANTS
 from agpt.model.retrofit import describe, freeze_backbone, from_gpt2, gpt2_config
-from agpt.model.targets import exit_targets
+from agpt.model.targets import exit_targets, sample_positions
 from agpt.precision import describe_device, make_scaler, select_precision
 
 STAGES = ("dense", "routers", "joint")
@@ -178,8 +185,10 @@ def evaluate(model, raw_model, loader, device, device_type, steps=20,
         x, y = x.to(device), y.to(device)
         with torch.autocast(device_type=device_type, dtype=amp_dtype,
                             enabled=device_type == "cuda"):
-            lab = derive_labels(raw_model, x) if labels else None
-            _, losses, stats = model(x, targets=y, exit_labels=lab)
+            lab, lab_mask = (derive_labels(raw_model, x) if labels
+                             else (None, None))
+            _, losses, stats = model(x, targets=y, exit_labels=lab,
+                                     label_mask=lab_mask)
         total += losses["lm"].item()
         for k, v in stats_to_floats(stats).items():
             agg[k] = agg.get(k, 0.0) + v
@@ -191,20 +200,24 @@ def evaluate(model, raw_model, loader, device, device_type, steps=20,
 def derive_labels(raw_model, x):
     """Run the stack densely and turn what the later layers did into exit labels.
 
-    Costs one extra forward pass per micro-step, roughly a third again on top of
-    forward+backward. That is the price of supervised routing targets, and it buys the
-    thing that makes Stage 2 converge in ~1500 steps instead of not converging: the
-    router is told what the right answer was, rather than having to infer it from a
-    language-modelling gradient that reaches it through a straight-through estimator.
+    Returns (labels, mask). The mask marks which positions were labelled; under the KL
+    rule that is a random `label_fraction` of them, resampled every step.
+
+    Costs one extra dense forward per micro-step on top of forward+backward. That is
+    the price of supervised routing targets, and it buys the thing that makes Stage 2
+    converge: the router is told what the right answer was, rather than having to infer
+    it from a language-modelling gradient reaching it through a straight-through
+    estimator.
     """
     cfg = raw_model.config
     if not cfg.router_layers:
-        return None
+        return None, None
+    mask = sample_positions(x.shape, cfg.label_fraction, x.device)
     hiddens = raw_model.dense_hidden_states(x)
     labels, _ = exit_targets(hiddens, cfg,
                              ln_f=raw_model.transformer.ln_f,
-                             lm_head=raw_model.lm_head)
-    return labels
+                             lm_head=raw_model.lm_head, mask=mask)
+    return labels, mask
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +292,10 @@ def build_parser():
     ap.add_argument("--n-min-layers", type=int, default=None)
     ap.add_argument("--target-type", choices=["delta", "kl"], default=None)
     ap.add_argument("--target-tau", type=float, default=None)
+    ap.add_argument("--label-fraction", type=float, default=None,
+                    help="fraction of positions labelled each step. The KL rule needs "
+                         "a vocab-sized projection per layer, so full coverage costs "
+                         "~15x the forward pass; 0.125 is the default for it")
     ap.add_argument("--lambda-router", type=float, default=None)
     ap.add_argument("--lambda-depth", type=float, default=None,
                     help="weight on the expected-depth penalty. This is the knob "
@@ -316,7 +333,8 @@ def config_overrides(args):
     """CLI routing flags -> AdaptiveGPTConfig kwargs, omitting anything unset."""
     named = dict(dropout=args.dropout,
                  n_min_layers=args.n_min_layers, target_type=args.target_type,
-                 target_tau=args.target_tau, lambda_router=args.lambda_router,
+                 target_tau=args.target_tau, label_fraction=args.label_fraction,
+                 lambda_router=args.lambda_router,
                  lambda_depth=args.lambda_depth,
                  fixed_exit_layer=args.fixed_exit_layer,
                  random_continue_p=args.random_continue_p,
@@ -376,7 +394,7 @@ def main():
         cfg = variant(args.variant, block_size=T, **overrides)
         model = AdaptiveGPT(cfg).to(device)
 
-    start_step, best_val = 0, float("inf")
+    start_step, best_val, last_val = 0, float("inf"), float("nan")
     if args.init_from:
         load_init(model, args.init_from, device)
 
@@ -455,6 +473,7 @@ def main():
             val_loss, val_stats = evaluate(model, raw_model, val_loader, device,
                                            device_type, args.eval_steps,
                                            amp_dtype=amp_dtype, labels=want_labels)
+            last_val = val_loss
             print(f"  [eval] step {step} val_loss {val_loss:.4f} "
                   f"ppl {math.exp(min(val_loss, 20)):.2f} "
                   f"depth {val_stats.get('depth', 0):.2f}")
@@ -480,8 +499,10 @@ def main():
             x, y = train_loader.next_batch()
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             with autocast:
-                labels = derive_labels(raw_model, x) if want_labels else None
-                _, losses, stats = model(x, targets=y, exit_labels=labels)
+                labels, lab_mask = (derive_labels(raw_model, x) if want_labels
+                                    else (None, None))
+                _, losses, stats = model(x, targets=y, exit_labels=labels,
+                                         label_mask=lab_mask)
             scaler.scale(losses["total"] / grad_accum).backward()
             for k in acc:
                 acc[k] += losses[k].item() / grad_accum
@@ -534,6 +555,26 @@ def main():
             }, os.path.join(run_dir, f"ckpt_{step:06d}.pt"))
             print(f"  [ckpt] step {step}")
             prune_checkpoints(run_dir, args.keep_ckpts)
+
+    # final.pt -- and the stage handoffs use THIS, not best.pt.
+    #
+    # `best.pt` selects on validation loss, which is the wrong criterion for every
+    # stage but the first. Under `--stage routers` the backbone is frozen, so the loss
+    # can only rise as tokens begin to exit: best.pt is therefore always step 0, and
+    # chaining Stage 3 off it silently discards the entire router training.
+    #
+    # That is not hypothetical. The first full run did exactly this -- Stage 2's
+    # best.pt was written at step 0, and Stage 3 began from untrained routers
+    # (bce 0.018, depth 12.00) with nothing to show for the 1500 steps before it.
+    torch.save({"model": raw_model.state_dict(), "config": cfg,
+                "step": args.max_steps - 1, "val_loss": last_val,
+                "args": vars(args)},
+               os.path.join(run_dir, "final.pt"))
+    print(f"  [final] step {args.max_steps - 1} -> final.pt")
+    if args.stage != "dense":
+        print("  note   : chain the next stage from final.pt. best.pt selects on "
+              "validation\n           loss, which rises as tokens exit, so it "
+              "tends to be step 0 here.")
 
     print(f"\ndone -> {run_dir}")
 

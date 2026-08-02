@@ -1,7 +1,7 @@
 """Sample from a checkpoint and show how deep each token went.
 
-    python scripts/infer.py --ckpt runs/s3_joint/best.pt --prompt "The capital of"
-    python scripts/infer.py --ckpt runs/s3_joint/best.pt --show-depth
+    python scripts/infer.py --ckpt runs/s3_joint/final.pt --prompt "The capital of"
+    python scripts/infer.py --ckpt runs/s3_joint/final.pt --show-depth
 
 An aggregate depth of 6.2 layers/token tells you the model is cheaper. It does not
 tell you it is cheaper *for the right tokens*, which is the actual claim. Printing the

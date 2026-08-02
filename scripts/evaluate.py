@@ -1,8 +1,8 @@
 """Evaluate one checkpoint: perplexity, depth, FLOPs, and router health.
 
-    python scripts/evaluate.py --ckpt runs/s3_joint/best.pt
-    python scripts/evaluate.py --ckpt runs/s3_joint/best.pt --confidence
-    python scripts/evaluate.py --ckpt runs/s3_joint/best.pt --oracle
+    python scripts/evaluate.py --ckpt runs/s3_joint/final.pt
+    python scripts/evaluate.py --ckpt runs/s3_joint/final.pt --confidence
+    python scripts/evaluate.py --ckpt runs/s3_joint/final.pt --oracle
 
 `--oracle` is the diagnostic worth running before concluding the method failed. It
 reports the depth the Delta rule would have chosen if it could see the future, and how

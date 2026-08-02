@@ -66,12 +66,35 @@ class AdaptiveGPTConfig:
     # ---- exit targets (Stage 2 supervision) --------------------------------
     # How the "this token has converged" label is derived from a dense forward pass.
     #   "delta" : relative remaining change in the residual stream,
-    #             r_l = ||h_L - h_l|| / ||h_L||. Cheap. This is the plan's Delta rule.
+    #             r_l = ||h_L - h_l|| / ||h_L||. Cheap, and MEASURED NOT TO WORK --
+    #             see below. Kept because reproducing that result is worth something.
     #   "kl"    : KL( p(.|h_L) || p(.|h_l) ) through the shared head. Measures what
     #             actually matters -- whether the prediction would change -- at the
     #             cost of an extra vocab-sized projection per layer.
-    target_type: str = "delta"
-    target_tau: float = 0.05       # exit where the remaining change is below this
+    #
+    # Why the default is `kl` despite costing ~15x more
+    # -------------------------------------------------
+    # Measured on a trained 40M model (docs/DESIGN_NOTES.md section 11), the median
+    # delta ratio falls almost linearly with depth -- 0.94, 0.93, 0.91, ..., 0.40,
+    # 0.20, 0.00 -- because each layer contributes a roughly equal-size step to the
+    # residual stream. So `r_l` measures HOW MANY LAYERS ARE LEFT, not whether this
+    # particular token has settled. Its spread across tokens is ~0.3 of its median
+    # while the layer-to-layer change is comparable, so thresholding it makes every
+    # token exit within one layer of every other: a step function, not a distribution.
+    # The delta rule can therefore only ever produce a fixed-depth model -- exactly
+    # the baseline the adaptive arm is supposed to beat.
+    #
+    # KL's spread across tokens is ~4x its median at the same layers, and it yields a
+    # genuine per-token depth distribution.
+    target_type: str = "kl"
+    target_tau: float = 1.0        # exit where the remaining change is below this
+    # Fraction of positions labelled each step. The KL rule needs a vocab-sized
+    # projection per layer, which measured 580 ms per B=4 batch against 38 ms for the
+    # forward pass it rides on -- unaffordable every micro-step. The router BCE
+    # averages over tokens anyway, so labelling a random subset is statistically clean
+    # and cuts the cost proportionally. 0 resolves to 1.0 for `delta` (which is cheap)
+    # and 0.125 for `kl`.
+    label_fraction: float = 0.0
 
     # ---- baseline arms ----------------------------------------------------
     # exit_mode="fixed": run layers [0, fixed_exit_layer). 0 resolves to two thirds of
@@ -114,6 +137,11 @@ class AdaptiveGPTConfig:
             f"unknown exited_as_keys {self.exited_as_keys!r}"
         assert 0 < self.n_min_layers < self.n_layer, \
             "n_min_layers must be positive and leave at least one routable layer"
+        if self.label_fraction <= 0.0:
+            # Resolved here so `to_dict` and the saved config record what was used.
+            self.label_fraction = 0.125 if self.target_type == "kl" else 1.0
+        assert 0.0 < self.label_fraction <= 1.0, \
+            f"label_fraction {self.label_fraction} outside (0, 1]"
         if self.fixed_exit_layer <= 0:
             # Resolved here rather than at the use site so `to_dict` and the saved
             # config record the depth the run actually used.

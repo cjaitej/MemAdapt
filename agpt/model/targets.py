@@ -71,20 +71,50 @@ def delta_targets(hiddens, tau):
     return _monotone(ratios > tau).to(h_final.dtype), ratios
 
 
+def sample_positions(shape, fraction, device, generator=None):
+    """A random (B, T) bool mask selecting `fraction` of the positions.
+
+    Which positions get labelled is resampled every step, so over a run every position
+    is labelled many times -- this trades a little gradient noise for a large constant
+    factor, it does not permanently hide part of the corpus from the routers.
+    """
+    if fraction >= 1.0:
+        return torch.ones(shape, dtype=torch.bool, device=device)
+    return torch.rand(shape, device=device, generator=generator) < fraction
+
+
 @torch.no_grad()
-def kl_targets(hiddens, tau, ln_f, lm_head, chunks=8):
+def kl_targets(hiddens, tau, ln_f, lm_head, chunks=8, mask=None):
     """Remaining change in the predictive distribution, in nats.
 
-    Chunked over the flattened token axis: the (B*T, vocab) logits are ~400 MB in
-    fp32 at B=4, T=512, and this needs them once per layer. Materialising all of them
-    is an instant OOM on a 4 GB card, which is the card this project targets.
+    Chunked over the flattened token axis: the (B*T, vocab) logits are ~400 MB in fp32
+    at B=4, T=512, and this needs them once per layer. Materialising all of them is an
+    instant OOM on a 4 GB card, which is the card this project targets.
+
+    `mask` restricts the work to a subset of positions. This is not an optimisation
+    detail -- measured on the target GPU this function costs 580 ms per B=4 batch
+    against 38 ms for the forward pass it rides on, so at full coverage it dominates
+    training by more than an order of magnitude. Unmasked positions come back with a
+    ratio of 0, which `_monotone` turns into an all-exit label; the caller MUST weight
+    them out of the loss, which is what `label_mask` does in `AdaptiveGPT.forward`.
+    Feeding these labels in unweighted would teach every unlabelled token to exit
+    immediately.
     """
     n_layer = len(hiddens) - 1
     B, T, _ = hiddens[0].shape
     ratios = hiddens[0].new_zeros(n_layer, B, T)
+    flat_ratios = ratios.view(n_layer, -1)
 
     flat_final = ln_f(hiddens[-1]).view(B * T, -1)
     flat_layers = [ln_f(h).view(B * T, -1) for h in hiddens[1:]]
+
+    index = None
+    if mask is not None:
+        index = mask.reshape(-1).nonzero(as_tuple=True)[0]
+        if index.numel() == 0:
+            return _monotone(ratios > tau).to(hiddens[-1].dtype), ratios
+        flat_final = flat_final[index]
+        flat_layers = [f[index] for f in flat_layers]
 
     start = 0
     for xf in flat_final.chunk(max(chunks, 1), dim=0):
@@ -93,26 +123,32 @@ def kl_targets(hiddens, tau, ln_f, lm_head, chunks=8):
         p_final = log_p_final.exp()
         for l, flat in enumerate(flat_layers):
             log_p_l = F.log_softmax(lm_head(flat[start:start + n]).float(), dim=-1)
-            kl = (p_final * (log_p_final - log_p_l)).sum(-1)
-            ratios.view(n_layer, -1)[l, start:start + n] = kl.to(ratios.dtype)
+            kl = (p_final * (log_p_final - log_p_l)).sum(-1).to(ratios.dtype)
+            if index is None:
+                flat_ratios[l, start:start + n] = kl
+            else:
+                flat_ratios[l, index[start:start + n]] = kl
         start += n
 
     return _monotone(ratios > tau).to(hiddens[-1].dtype), ratios
 
 
 @torch.no_grad()
-def exit_targets(hiddens, config, ln_f=None, lm_head=None):
+def exit_targets(hiddens, config, ln_f=None, lm_head=None, mask=None):
     """Dispatch on `config.target_type`. Returns (targets, ratios).
 
     `targets[l]` is the label for the router that sits after block l. Only the entries
     for `config.router_layers` are used; the rest are computed anyway because the full
     (n_layer, B, T) tensor is what the oracle-depth figure plots.
+
+    `mask` is honoured only by the KL rule -- the delta rule is cheap enough that
+    subsampling it would trade accuracy for nothing.
     """
     if config.target_type == "kl":
         if ln_f is None or lm_head is None:
             raise ValueError("target_type='kl' needs ln_f and lm_head")
         return kl_targets(hiddens, config.target_tau, ln_f, lm_head,
-                          chunks=max(config.ce_chunks, 1) * 2)
+                          chunks=max(config.ce_chunks, 1) * 2, mask=mask)
     return delta_targets(hiddens, config.target_tau)
 
 

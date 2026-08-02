@@ -1,6 +1,6 @@
 """Every figure in the writeup, from the JSON the eval scripts emit.
 
-    python scripts/compare.py --ckpt runs/s3_joint/best.pt      # -> results/compare.json
+    python scripts/compare.py --ckpt runs/s3_joint/final.pt      # -> results/compare.json
     python scripts/benchmark.py --compile                       # -> results/benchmark.json
     python scripts/figures.py                                   # -> figures/*.png + *.csv
 

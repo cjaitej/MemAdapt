@@ -99,20 +99,20 @@ python -m agpt.train --stage dense --run-name s1_dense \
     --max-steps 3600 --dropout 0.1 --eval-steps 40 --compile
 
 # Stage 2 — freeze it, fit the routers against derived convergence labels
-python -m agpt.train --stage routers --init-from runs/s1_dense/best.pt \
+python -m agpt.train --stage routers --init-from runs/s1_dense/final.pt \
     --run-name s2_routers --max-steps 1500 --dropout 0.1 --eval-steps 40 --compile
 
 # Stage 3 — unfreeze, let the model adapt to being interrupted
-python -m agpt.train --stage joint --init-from runs/s2_routers/best.pt \
+python -m agpt.train --stage joint --init-from runs/s2_routers/final.pt \
     --run-name s3_joint --max-steps 3000 --lambda-depth 0.05 \
     --dropout 0.1 --eval-steps 40 --compile
 
-python scripts/compare.py   --ckpt runs/s3_joint/best.pt      # the four-arm table
-python scripts/benchmark.py --ckpt runs/s3_joint/best.pt --compile
-python scripts/evaluate.py  --ckpt runs/s3_joint/best.pt --confidence --oracle
+python scripts/compare.py   --ckpt runs/s3_joint/final.pt      # the four-arm table
+python scripts/benchmark.py --ckpt runs/s3_joint/final.pt --compile
+python scripts/evaluate.py  --ckpt runs/s3_joint/final.pt --confidence --oracle
 python scripts/figures.py                                     # figures/*.png + *.csv
 
-python scripts/infer.py --ckpt runs/s3_joint/best.pt --show-depth
+python scripts/infer.py --ckpt runs/s3_joint/final.pt --show-depth
 streamlit run scripts/app.py
 ```
 
@@ -124,6 +124,12 @@ batches** at B=8/T=512, so `--eval-steps` above 60 just re-measures the same dat
 Training is multi-epoch by construction at this corpus size, which is why `--dropout
 0.1` appears above; the nanoGPT default of 0.0 assumes a single pass over something
 much larger.
+
+**Chain the stages through `final.pt`, never `best.pt`.** `best.pt` selects on
+validation loss, which is the right criterion only for Stage 1. Under `--stage routers`
+the backbone is frozen so the loss can only rise as tokens start exiting, making
+`best.pt` step 0 — and chaining off it discards the whole stage. The first full run did
+exactly that (`docs/DESIGN_NOTES.md` §12).
 
 Plumbing check with no corpus at all:
 
@@ -161,13 +167,23 @@ it alone:
 
 ```
 delta rule:  r_l = ‖h_L − h_l‖ / ‖h_L‖          exit where r_l < tau
-kl rule:     r_l = KL( p(·|h_L) ‖ p(·|h_l) )    exit where r_l < tau
+kl rule:     r_l = KL( p(·|h_L) ‖ p(·|h_l) )    exit where r_l < tau   ← default
 ```
 
-`delta` is the cheaper one and is the default. `kl` measures the thing the model is
-actually judged on, and the two disagree more than you would expect — the last layers
-of a trained transformer move the residual stream substantially while barely changing
-the argmax. Report which you used.
+**The `delta` rule does not work, and that is a measured result rather than a tuning
+problem.** Each block adds a roughly equal-size step to the residual stream, so `r_l`
+falls almost linearly with layers-remaining (median .94 .93 .91 … .40 .20 .00) and
+varies ~10× less across *tokens* than across *layers*. Thresholding it makes every
+token exit within one layer of every other — a step function, not a distribution — so
+the delta rule can only ever produce a fixed-depth model, which is precisely the
+baseline this project exists to beat. The first full training run confirmed it end to
+end: oracle depth 12.00, router↔oracle agreement 99.97%, nothing exited.
+
+`kl` measures the thing the model is actually judged on and has ~4× the relative spread
+across tokens, giving a genuine per-token depth distribution. It costs a vocab-sized
+projection per layer (580 ms per B=4 batch vs 38 ms for the forward pass), so labels are
+derived on a random `--label-fraction` of positions each step. Full detail and the
+measurements: `docs/DESIGN_NOTES.md` §10.
 
 **Stage 3 — joint.** Everything unfreezes and the model adapts to routing decisions
 that are already roughly right, under `LM + 0.1·BCE + λ·depth`. Sweep `--lambda-depth`

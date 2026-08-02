@@ -117,7 +117,7 @@ st.title("AdaptiveGPT — where the depth went")
 
 with st.sidebar:
     st.header("model")
-    ckpt = st.text_input("checkpoint", "runs/s3_joint/best.pt")
+    ckpt = st.text_input("checkpoint", "runs/s3_joint/final.pt")
     exit_mode = st.selectbox(
         "routing rule", ["(as saved)", "adaptive", "dense", "fixed", "random"],
         help="The baselines are the same weights under a different rule -- exactly "

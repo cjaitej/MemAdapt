@@ -277,3 +277,56 @@ def test_zero_dropout_changes_nothing(tokens):
         a, _, _ = model(tokens, return_logits=True)
         b, _, _ = model(tokens, return_logits=True)
     assert torch.equal(a, b)
+
+
+# ---------------------------------------------------------------------------
+# The two fixes from the first real training run
+# ---------------------------------------------------------------------------
+
+def test_depth_penalty_measures_the_depth_actually_computed(tokens):
+    """The depth loss must not be satisfiable without anyone exiting.
+
+    Charging the soft cumulative probability let a run reach a reported 7.66 layers
+    while the gate -- which thresholds at 0.5 -- still ran 11.27: moving a token from
+    0.99 to 0.6 pays the penalty and changes nothing. Counting the straight-through
+    gate instead makes the reported number the real one.
+    """
+    model, cfg = build("adaptive")
+    randomise_routers(model)
+    with torch.no_grad():
+        _, losses, stats = model(tokens, targets=tokens)
+    assert float(losses["depth"]) * cfg.n_layer == pytest.approx(
+        float(stats["depth"]), rel=1e-4), \
+        "the depth penalty and the reported depth disagree"
+
+
+def test_depth_penalty_still_reaches_the_router(tokens):
+    """A hard forward value must not cost the penalty its gradient."""
+    model, cfg = build("adaptive")
+    randomise_routers(model)
+    model.train()
+    model.set_lambda_router(0.0)
+    model.set_lambda_depth(1.0)
+    _, losses, _ = model(tokens, targets=tokens)
+    losses["depth"].backward()
+    total = sum(p.grad.abs().sum() for p in model.routers.parameters()
+                if p.grad is not None)
+    assert total > 0, "the depth penalty produced no router gradient"
+
+
+def test_label_mask_restricts_the_bce(tokens):
+    """Positions outside the mask must contribute nothing to the router loss."""
+    from agpt.model.targets import exit_targets
+    model, cfg = build("adaptive")
+    randomise_routers(model)
+    hiddens = model.dense_hidden_states(tokens)
+    labels, _ = exit_targets(hiddens, cfg, model.transformer.ln_f, model.lm_head)
+
+    full = torch.ones(tokens.shape, dtype=torch.bool)
+    none_ = torch.zeros(tokens.shape, dtype=torch.bool)
+    with torch.no_grad():
+        _, a, _ = model(tokens, targets=tokens, exit_labels=labels, label_mask=full)
+        _, b, _ = model(tokens, targets=tokens, exit_labels=labels, label_mask=none_)
+        _, c, _ = model(tokens, targets=tokens, exit_labels=labels)
+    assert float(a["router"]) == pytest.approx(float(c["router"]), rel=1e-5)
+    assert float(b["router"]) == 0.0, "an all-false mask still contributed loss"

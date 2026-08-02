@@ -1,7 +1,7 @@
 """Throughput, latency, VRAM, and the FLOP-model validation.
 
     python scripts/benchmark.py --compile
-    python scripts/benchmark.py --ckpt runs/s3_joint/best.pt --compile
+    python scripts/benchmark.py --ckpt runs/s3_joint/final.pt --compile
 
 With no checkpoint this benchmarks freshly initialised models, which is enough for the
 speed numbers (throughput does not depend on the weights) and is how you check whether

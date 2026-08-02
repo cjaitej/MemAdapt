@@ -181,14 +181,18 @@ class AdaptiveGPT(nn.Module):
 
     # -- forward (gated, static shapes) -------------------------------------
 
-    def forward(self, idx, targets=None, exit_labels=None, return_logits=False,
-                generator=None):
+    def forward(self, idx, targets=None, exit_labels=None, label_mask=None,
+                return_logits=False, generator=None):
         """
         Parameters
         ----------
         exit_labels : (n_layer, B, T) float from `targets.exit_targets`, or None.
             When given, each router is trained by BCE against its row. This is the
             Stage 2 supervision; Stage 3 usually passes it too, at a lower weight.
+        label_mask : (B, T) bool marking which positions `exit_labels` is valid for.
+            Required whenever the labels were derived on a subsample -- unlabelled
+            positions come back as "exit", and training on those teaches every token
+            to stop immediately.
 
         Returns (logits_or_None, losses, stats).
         """
@@ -219,7 +223,16 @@ class AdaptiveGPT(nn.Module):
                 x = x + g.unsqueeze(-1) * block.delta(x)
                 hard = (alive_p > c.exit_threshold).to(depth.dtype)
                 depth = depth + hard * on + (1.0 - on)
-                expected_depth = expected_depth + alive_p * on + (1.0 - on)
+                # The penalty counts `g`, not `alive_p`. Under straight-through `g`
+                # takes the HARD value, so the depth loss reports exactly the depth
+                # the model computes, while the gradient still flows to the router.
+                #
+                # Charging `alive_p` instead let the objective be satisfied without
+                # any token ever exiting: a run at lambda_depth=0.2 pushed the soft
+                # sum down to 7.66 layers while the gate -- which thresholds at 0.5 --
+                # still ran 11.27, because moving a token from 0.99 to 0.6 costs the
+                # penalty a lot and changes the computation not at all.
+                expected_depth = expected_depth + g
 
             if self._routes_at(l):
                 alive_by_layer[l] = (alive_p > c.exit_threshold).to(x.dtype)
@@ -238,7 +251,7 @@ class AdaptiveGPT(nn.Module):
             logits = self.lm_head(x)
 
         losses["router"] = self._router_loss(logits_by_layer, alive_by_layer,
-                                             exit_labels, x)
+                                             exit_labels, label_mask, x)
         losses["depth"] = expected_depth.mean() / c.n_layer
         if targets is not None:
             losses["total"] = (losses["lm"]
@@ -350,20 +363,27 @@ class AdaptiveGPT(nn.Module):
                 total = total + chunk_loss(xc, tc).float()
         return total / flat_t.numel()
 
-    def _router_loss(self, logits_by_layer, alive_by_layer, exit_labels, ref):
+    def _router_loss(self, logits_by_layer, alive_by_layer, exit_labels, label_mask,
+                     ref):
         """Mean BCE over the routers, against the derived convergence labels.
 
-        Each router is scored only on the tokens that were still alive when it ran.
-        A token that exited three layers ago never reaches this decision, and
-        training the head on it teaches it to score states it will never see.
+        Each router is scored on the tokens that were BOTH still alive when it ran and
+        actually labelled. Alive, because a token that exited three layers ago never
+        reaches this decision and training on it teaches the head to score states it
+        will never see. Labelled, because the KL rule runs on a subsample and every
+        unlabelled position carries a default "exit" label that would otherwise
+        collapse the whole stack.
         """
         if not logits_by_layer or exit_labels is None:
             return ref.new_zeros(())
         total = ref.new_zeros(())
         for l, logit in logits_by_layer.items():
+            w = alive_by_layer[l].float()
+            if label_mask is not None:
+                w = w * label_mask.to(w.dtype)
             total = total + router_bce(logit.float(),
                                        exit_labels[l].to(logit.device).float(),
-                                       weight=alive_by_layer[l].float())
+                                       weight=w)
         return total / len(logits_by_layer)
 
     # -- telemetry ----------------------------------------------------------
